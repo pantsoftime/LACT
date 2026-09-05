@@ -21,6 +21,9 @@ pub enum ClockCategory {
     VramCurveClock,
     CoreCurveVoltage,
     VramCurveVoltage,
+    /// NVIDIA RM ClockClient domains; edited on the advanced voltage page,
+    /// never on the OC page's clock frame.
+    RmDomain,
 }
 
 impl ClockCategory {
@@ -40,6 +43,10 @@ impl ClockCategory {
             ClockspeedType::MemVfCurveClock(_) => ClockCategory::VramCurveClock,
             ClockspeedType::GpuVfCurveVoltage(_) => ClockCategory::CoreCurveVoltage,
             ClockspeedType::MemVfCurveVoltage(_) => ClockCategory::VramCurveVoltage,
+            ClockspeedType::XbarClockOffset
+            | ClockspeedType::SysClockOffset
+            | ClockspeedType::VideoClockOffset
+            | ClockspeedType::MsvddOffset => ClockCategory::RmDomain,
             ClockspeedType::Reset => unreachable!(),
         }
     }

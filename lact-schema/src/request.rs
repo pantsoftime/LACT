@@ -165,6 +165,13 @@ pub enum ClockspeedType {
     VoltageOffset,
     VoltageBoost,
 
+    // NVIDIA RM ClockClient domains (private interface, driver-branch specific)
+    XbarClockOffset,
+    SysClockOffset,
+    VideoClockOffset,
+    /// MSVDD rail offset on the XBAR domain, millivolts
+    MsvddOffset,
+
     MaxMemoryClock,
     MinMemoryClock,
     MemClockOffset(u32),

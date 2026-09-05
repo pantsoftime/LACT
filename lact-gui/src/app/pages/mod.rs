@@ -1,3 +1,4 @@
+pub mod adv_voltage_page;
 pub mod crash_page;
 pub mod displays_page;
 pub mod info_page;

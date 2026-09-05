@@ -261,7 +261,11 @@ impl DriverHandle {
         Ok(info_list[0].data)
     }
 
-    unsafe fn query_rm_control<T: Copy>(&self, cmd: u32, params: &mut T) -> anyhow::Result<()> {
+    pub(super) unsafe fn query_rm_control<T: Copy>(
+        &self,
+        cmd: u32,
+        params: &mut T,
+    ) -> anyhow::Result<()> {
         unsafe { self.query_rm_control_on_object(cmd, self.subdevice_handle, params) }
     }
 

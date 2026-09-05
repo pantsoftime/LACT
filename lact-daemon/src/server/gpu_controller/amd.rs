@@ -551,6 +551,9 @@ impl AmdGpuController {
         }
 
         ClockspeedStats {
+            xbar_clockspeed: None,
+            sys_clockspeed: None,
+            video_clockspeed: None,
             gpu_clockspeed: self.hw_mon_and_then(HwMon::get_gpu_clockspeed),
             target_gpu_clockspeed,
             vram_clockspeed,

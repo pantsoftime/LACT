@@ -751,6 +751,11 @@ fn clock_title(clock_type: ClockspeedType) -> String {
         ClockspeedType::MemVfCurveVoltage(pstate) => {
             fl!(I18N, "mem-pstate-clock-voltage", pstate = pstate)
         }
+        // Edited on the Advanced page; never rows here.
+        ClockspeedType::XbarClockOffset => "XBAR clock offset".to_owned(),
+        ClockspeedType::SysClockOffset => "SYS clock offset".to_owned(),
+        ClockspeedType::VideoClockOffset => "Video clock offset".to_owned(),
+        ClockspeedType::MsvddOffset => "MSVDD offset".to_owned(),
         ClockspeedType::Reset => unreachable!(),
     }
 }

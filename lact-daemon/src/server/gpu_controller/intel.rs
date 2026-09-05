@@ -846,6 +846,9 @@ impl GpuController for IntelGpuController {
             .or(target_gpu_clockspeed);
 
         let clockspeed = ClockspeedStats {
+            xbar_clockspeed: None,
+            sys_clockspeed: None,
+            video_clockspeed: None,
             gpu_clockspeed,
             target_gpu_clockspeed,
             vram_clockspeed: None,

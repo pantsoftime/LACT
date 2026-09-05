@@ -1,3 +1,4 @@
+pub mod clock_client;
 mod driver;
 pub mod nvapi;
 
@@ -18,6 +19,7 @@ use amdgpu_sysfs::{
     hw_mon::Temperature,
 };
 use anyhow::{Context, anyhow, bail, ensure};
+use clock_client::{ControlBlock, MSVDD_RAIL, RmClockDomain, RmDomainKind};
 use driver::DriverHandle;
 use futures::{FutureExt, future::LocalBoxFuture};
 use indexmap::IndexMap;
@@ -29,6 +31,7 @@ use lact_schema::{
     ProcessList, ProcessType, ProcessUtilizationType, TemperatureEntry, VoltageStats, VramStats,
     config::{FanControlSettings, FanCurve, GpuConfig, NvidiaCurvePoint},
 };
+use lact_schema::{NvidiaRmClockDomain, config::ClocksConfiguration};
 use nvapi::NvApi;
 use nvml_wrapper::{
     Device, Nvml,
@@ -66,6 +69,8 @@ pub struct NvidiaGpuController {
 
     nvapi: Option<(Rc<NvApi>, NvPhysicalGpuHandle)>,
     driver_handle: Option<DriverHandle>,
+    /// RM ClockClient domains, if the private interface passed its self-check
+    rm_clock_domains: Option<Vec<RmClockDomain>>,
     nvapi_therm_channel_mask: Option<i32>,
 
     last_util_timestamp: Cell<Option<u64>>,
@@ -137,11 +142,20 @@ impl NvidiaGpuController {
             .temperature_threshold(TemperatureThreshold::AcousticCurr)
             .ok();
 
+        let rm_clock_domains = driver_handle.as_ref().and_then(|handle| {
+            let version = nvml.sys_driver_version().unwrap_or_default();
+            clock_client::probe(handle, &version)
+        });
+        if rm_clock_domains.is_some() {
+            tracing::info!("RM clock domain controls (XBAR/SYS/video, MSVDD) enabled");
+        }
+
         Ok(Self {
             nvml,
             nvapi: nvapi.zip(nvapi_handle),
             common,
             driver_handle,
+            rm_clock_domains,
             nvapi_therm_channel_mask,
             initial_target_temp: target_temp,
             last_util_timestamp: Cell::new(None),
@@ -152,6 +166,147 @@ impl NvidiaGpuController {
             vf_curve_written: Cell::new(false),
             voltage_boost_written: Cell::new(false),
         })
+    }
+
+    // ---- RM ClockClient (XBAR / SYS / video offsets, MSVDD rail offset) ----
+
+    fn rm(&self) -> Option<(&DriverHandle, &[RmClockDomain])> {
+        Some((
+            self.driver_handle.as_ref()?,
+            self.rm_clock_domains.as_deref()?,
+        ))
+    }
+
+    fn rm_domain(&self, kind: RmDomainKind) -> Option<&RmClockDomain> {
+        self.rm_clock_domains
+            .as_deref()?
+            .iter()
+            .find(|d| d.kind == Some(kind) && d.controllable && d.offset_range_mhz > 0)
+    }
+
+    fn rm_measure_mhz(&self, kind: RmDomainKind) -> Option<u64> {
+        let (handle, domains) = self.rm()?;
+        let domain = domains.iter().find(|d| d.kind == Some(kind))?;
+        handle
+            .clk_measure_khz(domain.api_domain)
+            .ok()
+            .map(|khz| u64::from(khz) / 1000)
+    }
+
+    /// Offset entry (current / min / max, MHz) for a frequency domain.
+    fn rm_freq_offset(
+        &self,
+        block: &ControlBlock,
+        kind: RmDomainKind,
+    ) -> Option<NvidiaClockOffset> {
+        let domain = self.rm_domain(kind)?;
+        let range = i32::try_from(domain.offset_range_mhz).ok()?;
+        Some(NvidiaClockOffset {
+            current: block.freq_offset_khz(domain.index) / 1000,
+            min: -range,
+            max: range,
+        })
+    }
+
+    /// MSVDD rail offset on the XBAR domain, in millivolts. The driver does
+    /// not publish a range for rail offsets; the bound here is deliberately
+    /// tight because the only measured effect of +20 mV was a lower XBAR
+    /// clock and a hard lockup at +450 MHz that voltage did not prevent.
+    fn rm_msvdd_offset(&self, block: &ControlBlock) -> Option<NvidiaClockOffset> {
+        let domain = self.rm_domain(RmDomainKind::Xbar)?;
+        Some(NvidiaClockOffset {
+            current: block.rail_offset_uv(domain.index, MSVDD_RAIL) / 1000,
+            min: -50,
+            max: 50,
+        })
+    }
+
+    fn rm_domain_table(&self, block: &ControlBlock) -> Vec<NvidiaRmClockDomain> {
+        let Some((handle, domains)) = self.rm() else {
+            return Vec::new();
+        };
+        domains
+            .iter()
+            .map(|d| NvidiaRmClockDomain {
+                index: d.index,
+                name: d.name(),
+                api_domain: d.api_domain,
+                measured_khz: handle.clk_measure_khz(d.api_domain).ok(),
+                offset_khz: if d.controllable {
+                    block.freq_offset_khz(d.index)
+                } else {
+                    0
+                },
+                offset_range_mhz: d.offset_range_mhz,
+                controllable: d.controllable,
+            })
+            .collect()
+    }
+
+    /// Apply the configured RM offsets. Missing values mean stock (0) — the
+    /// same semantics as every other clock setting in LACT. Writes only when
+    /// the block would actually change, since config is reapplied on a timer.
+    fn apply_rm_offsets(&self, clocks: &ClocksConfiguration) -> anyhow::Result<()> {
+        let Some((handle, _)) = self.rm() else {
+            if clocks.xbar_clock_offset.is_some()
+                || clocks.sys_clock_offset.is_some()
+                || clocks.video_clock_offset.is_some()
+                || clocks.msvdd_offset.is_some()
+            {
+                bail!("RM clock domain controls are not available on this driver");
+            }
+            return Ok(());
+        };
+
+        let current = handle.clk_domains_get_control()?;
+        let mut wanted = current;
+        for (kind, mhz) in [
+            (RmDomainKind::Xbar, clocks.xbar_clock_offset),
+            (RmDomainKind::Sys, clocks.sys_clock_offset),
+            (RmDomainKind::Video, clocks.video_clock_offset),
+        ] {
+            let mhz = mhz.unwrap_or(0);
+            let Some(domain) = self.rm_domain(kind) else {
+                if mhz != 0 {
+                    bail!("{kind} offset is not adjustable on this GPU");
+                }
+                continue;
+            };
+            let range = i32::try_from(domain.offset_range_mhz).unwrap_or(0);
+            if mhz.abs() > range {
+                bail!("{kind} offset {mhz} MHz exceeds the driver range of ±{range} MHz");
+            }
+            wanted.set_freq_offset_khz(domain.index, mhz * 1000);
+        }
+        if let Some(domain) = self.rm_domain(RmDomainKind::Xbar) {
+            let mv = clocks.msvdd_offset.unwrap_or(0);
+            if mv.abs() > 50 {
+                bail!("MSVDD offset {mv} mV exceeds the ±50 mV bound");
+            }
+            wanted.set_rail_offset_uv(domain.index, MSVDD_RAIL, mv * 1000);
+        } else if clocks.msvdd_offset.is_some_and(|mv| mv != 0) {
+            bail!("MSVDD offset requires an adjustable XBAR domain");
+        }
+
+        if wanted.freq_offset_khz(0) == current.freq_offset_khz(0)
+            && (0..8u8).all(|i| {
+                wanted.freq_offset_khz(i) == current.freq_offset_khz(i)
+                    && (0..4).all(|r| wanted.rail_offset_uv(i, r) == current.rail_offset_uv(i, r))
+            })
+        {
+            return Ok(());
+        }
+
+        debug!(
+            "applying RM offsets: xbar {:?} sys {:?} video {:?} msvdd {:?} mV",
+            clocks.xbar_clock_offset,
+            clocks.sys_clock_offset,
+            clocks.video_clock_offset,
+            clocks.msvdd_offset
+        );
+        handle
+            .clk_domains_set_control(&wanted)
+            .context("Could not apply RM clock domain offsets")
     }
 
     fn device(&self) -> Device<'_> {
@@ -1080,6 +1235,9 @@ impl GpuController for NvidiaGpuController {
                 gpu_clockspeed: device.clock_info(Clock::Graphics).map(Into::into).ok(),
                 vram_clockspeed: device.clock_info(Clock::Memory).map(Into::into).ok(),
                 target_gpu_clockspeed: None,
+                xbar_clockspeed: self.rm_measure_mhz(RmDomainKind::Xbar),
+                sys_clockspeed: self.rm_measure_mhz(RmDomainKind::Sys),
+                video_clockspeed: self.rm_measure_mhz(RmDomainKind::Video),
                 sensors: extra_clocks,
             },
             throttle_info: device.current_throttle_reasons().ok().map(|reasons| {
@@ -1171,6 +1329,13 @@ impl GpuController for NvidiaGpuController {
             .inspect_err(|err| warn!("could not get voltage boost: {err:#}"))
             .ok();
 
+        let rm_block = self.rm().and_then(|(handle, _)| {
+            handle
+                .clk_domains_get_control()
+                .inspect_err(|err| warn!("could not read RM clock control block: {err:#}"))
+                .ok()
+        });
+
         let table = NvidiaClocksTable {
             gpu_offsets,
             mem_offsets,
@@ -1180,6 +1345,20 @@ impl GpuController for NvidiaGpuController {
             vram_clock_range,
             gpu_vf_curve,
             voltage_boost,
+            xbar_offset: rm_block
+                .as_ref()
+                .and_then(|b| self.rm_freq_offset(b, RmDomainKind::Xbar)),
+            sys_offset: rm_block
+                .as_ref()
+                .and_then(|b| self.rm_freq_offset(b, RmDomainKind::Sys)),
+            video_offset: rm_block
+                .as_ref()
+                .and_then(|b| self.rm_freq_offset(b, RmDomainKind::Video)),
+            msvdd_offset: rm_block.as_ref().and_then(|b| self.rm_msvdd_offset(b)),
+            rm_clock_domains: rm_block
+                .as_ref()
+                .map(|b| self.rm_domain_table(b))
+                .unwrap_or_default(),
         };
 
         Ok(ClocksInfo {
@@ -1294,6 +1473,8 @@ impl GpuController for NvidiaGpuController {
                     warn!("could not reset voltage boost: {err:#}");
                 }
             }
+
+            self.apply_rm_offsets(clocks)?;
 
             if config.fan_control_enabled {
                 let settings = config
@@ -1417,6 +1598,14 @@ impl GpuController for NvidiaGpuController {
         if self.voltage_boost_written.get() {
             self.reset_voltage_boost()
                 .context("Could not reset voltage boost")?;
+        }
+
+        if let Some((handle, _)) = self.rm()
+            && handle
+                .clk_domains_reset()
+                .context("Could not reset RM clock domain offsets")?
+        {
+            debug!("reset RM clock domain offsets to stock");
         }
 
         Ok(())

@@ -96,6 +96,14 @@ pub struct ClocksConfiguration {
     pub nvidia_gpu_vf_curve: IndexMap<u8, NvidiaCurvePoint>,
     pub voltage_offset: Option<i32>,
     pub voltage_boost: Option<i32>,
+    /// NVIDIA-only: frequency offsets (MHz) for the RM ClockClient domains that
+    /// NVML does not expose. Applied through the private control block; the
+    /// daemon refuses them on driver branches it has not verified.
+    pub xbar_clock_offset: Option<i32>,
+    pub sys_clock_offset: Option<i32>,
+    pub video_clock_offset: Option<i32>,
+    /// NVIDIA-only: MSVDD rail offset on the XBAR domain, in millivolts.
+    pub msvdd_offset: Option<i32>,
 }
 
 impl ClocksConfiguration {
@@ -138,6 +146,10 @@ impl ClocksConfiguration {
             ClockspeedType::MemVfCurveVoltage(point) => {
                 self.mem_vf_curve.entry(point).or_default().voltage = value;
             }
+            ClockspeedType::XbarClockOffset => self.xbar_clock_offset = value,
+            ClockspeedType::SysClockOffset => self.sys_clock_offset = value,
+            ClockspeedType::VideoClockOffset => self.video_clock_offset = value,
+            ClockspeedType::MsvddOffset => self.msvdd_offset = value,
             ClockspeedType::Reset => {
                 *self = ClocksConfiguration::default();
             }

@@ -3,6 +3,7 @@ oc-page = Overclocking
 thermals-page = Thermals
 software-page = Software Info
 displays-page = Display Info
+adv-voltage-page = Advanced voltage & XBAR
 
 hardware-info = Hardware Information
 

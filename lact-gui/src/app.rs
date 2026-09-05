@@ -54,6 +54,7 @@ use lact_schema::{
 use msg::AppMsg;
 use pages::{
     PageUpdate,
+    adv_voltage_page::{AdvVoltagePage, AdvVoltagePageMsg},
     crash_page::CrashPage,
     info_page::InformationPage,
     oc_page::{OcPage, OcPageMsg},
@@ -116,6 +117,7 @@ pub struct AppModel {
 
     info_page: relm4::Controller<InformationPage>,
     oc_page: relm4::Controller<OcPage>,
+    adv_voltage_page: relm4::Controller<AdvVoltagePage>,
     thermals_page: relm4::Controller<ThermalsPage>,
     software_page: relm4::Controller<SoftwarePage>,
     displays_page: relm4::Controller<DisplaysPage>,
@@ -303,6 +305,7 @@ impl AsyncComponent for AppModel {
                                             add_titled[Some("thermals_page"), &fl!(I18N, "thermals-page")] = model.thermals_page.widget(),
                                             add_titled[Some("software_page"), &fl!(I18N, "software-page")] = model.software_page.widget(),
                                             add_titled[Some("displays_page"), &fl!(I18N, "displays-page")] = model.displays_page.widget(),
+                                            add_titled[Some("adv_voltage_page"), &fl!(I18N, "adv-voltage-page")] = model.adv_voltage_page.widget(),
                                             add_named[Some("crash_page")] = model.crash_page.widget(),
 
                                             set_visible_child_name: &CONFIG.read().selected_tab,
@@ -428,6 +431,8 @@ impl AsyncComponent for AppModel {
 
         let oc_page =
             OcPage::launch(settings_changed.clone()).forward(sender.input_sender(), |msg| msg);
+        let adv_voltage_page =
+            AdvVoltagePage::launch_default().forward(sender.input_sender(), |msg| msg);
         let thermals_page = ThermalsPage::detach_default();
 
         let software_page = SoftwarePage::detach((system_info.clone(), daemon_client.embedded));
@@ -495,6 +500,7 @@ impl AsyncComponent for AppModel {
             info_dialog,
             info_page,
             oc_page,
+            adv_voltage_page,
             thermals_page,
             software_page,
             crash_page,
@@ -781,6 +787,10 @@ impl AppModel {
             }
             AppMsg::Stats(stats) => {
                 let update = PageUpdate::Stats(stats.clone());
+                self.adv_voltage_page.emit(AdvVoltagePageMsg::Update {
+                    update: update.clone(),
+                    initial: false,
+                });
                 self.oc_page.emit(OcPageMsg::Update {
                     update: update.clone(),
                     initial: false,
@@ -1078,6 +1088,10 @@ impl AppModel {
             update: update.clone(),
             initial: true,
         });
+        self.adv_voltage_page.emit(AdvVoltagePageMsg::Update {
+            update: update.clone(),
+            initial: true,
+        });
 
         sender.input(AppMsg::ReloadApiInfo);
 
@@ -1147,6 +1161,10 @@ impl AppModel {
             update: update.clone(),
             initial: true,
         });
+        self.adv_voltage_page.emit(AdvVoltagePageMsg::Update {
+            update: update.clone(),
+            initial: true,
+        });
         self.oc_page.emit(OcPageMsg::Update {
             update,
             initial: true,
@@ -1159,6 +1177,8 @@ impl AppModel {
                 None
             }
         };
+        self.adv_voltage_page
+            .emit(AdvVoltagePageMsg::ClocksTable(maybe_clocks_table.clone()));
         self.oc_page.emit(OcPageMsg::ClocksTable {
             table: maybe_clocks_table,
             vf_curve_is_configured: gpu_config
@@ -1238,6 +1258,9 @@ impl AppModel {
         self.thermals_page.model().apply_config(&mut gpu_config);
 
         self.oc_page
+            .model()
+            .apply_clocks_config(&mut gpu_config.clocks_configuration);
+        self.adv_voltage_page
             .model()
             .apply_clocks_config(&mut gpu_config.clocks_configuration);
 

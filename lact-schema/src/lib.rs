@@ -507,6 +507,36 @@ pub struct NvidiaClocksTable {
     pub gpu_vf_curve: Vec<NvidiaVfPoint>,
     #[serde(default)]
     pub voltage_boost: Option<NvidiaVoltageBoost>,
+    /// RM ClockClient frequency offsets (MHz) for domains NVML does not expose.
+    /// `None` means the daemon could not enable the private interface on this
+    /// driver, and the GUI should not offer the control.
+    #[serde(default)]
+    pub xbar_offset: Option<NvidiaClockOffset>,
+    #[serde(default)]
+    pub sys_offset: Option<NvidiaClockOffset>,
+    #[serde(default)]
+    pub video_offset: Option<NvidiaClockOffset>,
+    /// MSVDD rail offset on the XBAR domain, millivolts
+    #[serde(default)]
+    pub msvdd_offset: Option<NvidiaClockOffset>,
+    /// Every domain the RM ClockClient interface reports, for the live table
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rm_clock_domains: Vec<NvidiaRmClockDomain>,
+}
+
+/// One clock domain from NVIDIA's private RM ClockClient interface.
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct NvidiaRmClockDomain {
+    /// Index in the control block (not the same as `api_domain`'s bit)
+    pub index: u8,
+    pub name: String,
+    /// The CLK_MEASURE_FREQ selector bitmask for this domain
+    pub api_domain: u32,
+    pub measured_khz: Option<u32>,
+    pub offset_khz: i32,
+    /// Driver-permitted offset range in MHz; 0 means locked
+    pub offset_range_mhz: u32,
+    pub controllable: bool,
 }
 
 /// Nvidia core voltage boost, in percent
@@ -718,6 +748,13 @@ pub struct ClockspeedStats {
     #[serde(alias = "current_gfxclk")]
     pub target_gpu_clockspeed: Option<u64>,
     pub vram_clockspeed: Option<u64>,
+    /// NVIDIA RM-measured clocks (MHz) for domains NVML does not report
+    #[serde(default)]
+    pub xbar_clockspeed: Option<u64>,
+    #[serde(default)]
+    pub sys_clockspeed: Option<u64>,
+    #[serde(default)]
+    pub video_clockspeed: Option<u64>,
     #[serde(default)]
     pub sensors: IndexMap<String, u64>,
 }
