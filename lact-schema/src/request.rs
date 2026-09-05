@@ -171,6 +171,8 @@ pub enum ClockspeedType {
     VideoClockOffset,
     /// MSVDD rail offset on the XBAR domain, millivolts
     MsvddOffset,
+    /// NVVDD (rail 0) offset on the XBAR domain, millivolts. Experimental.
+    NvvddOffset,
 
     MaxMemoryClock,
     MinMemoryClock,

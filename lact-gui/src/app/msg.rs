@@ -23,6 +23,10 @@ pub enum AppMsg {
     ResetClocks,
     ResetPmfw,
     ShowGraphsWindow,
+    /// Open the graphs window on a plot showing these stats (added if missing)
+    ShowGraphsFor(Vec<crate::app::graphs_window::stat::StatType>),
+    /// Remove any plot showing exactly these stats
+    HideGraphsFor(Vec<crate::app::graphs_window::stat::StatType>),
     ShowProcessMonitor,
     DumpVBios,
     DebugSnapshot,

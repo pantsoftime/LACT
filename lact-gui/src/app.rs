@@ -832,6 +832,12 @@ impl AppModel {
                     .await?;
                 sender.input(AppMsg::ReloadData { full: false });
             }
+            AppMsg::HideGraphsFor(stats) => {
+                self.graphs_window.emit(GraphsWindowMsg::RemoveStats(stats));
+            }
+            AppMsg::ShowGraphsFor(stats) => {
+                self.graphs_window.emit(GraphsWindowMsg::ShowStats(stats));
+            }
             AppMsg::ShowGraphsWindow => {
                 self.graphs_window.emit(GraphsWindowMsg::Show);
             }
@@ -1262,7 +1268,7 @@ impl AppModel {
             .apply_clocks_config(&mut gpu_config.clocks_configuration);
         self.adv_voltage_page
             .model()
-            .apply_clocks_config(&mut gpu_config.clocks_configuration);
+            .apply_gpu_config(&mut gpu_config);
 
         let enabled_power_states = self.oc_page.model().get_enabled_power_states();
         gpu_config.power_states = enabled_power_states;

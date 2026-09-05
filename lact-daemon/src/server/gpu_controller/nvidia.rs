@@ -208,14 +208,15 @@ impl NvidiaGpuController {
         })
     }
 
-    /// MSVDD rail offset on the XBAR domain, in millivolts. The driver does
-    /// not publish a range for rail offsets; the bound here is deliberately
-    /// tight because the only measured effect of +20 mV was a lower XBAR
-    /// clock and a hard lockup at +450 MHz that voltage did not prevent.
-    fn rm_msvdd_offset(&self, block: &ControlBlock) -> Option<NvidiaClockOffset> {
+    /// A voltage-rail offset on the XBAR domain, in millivolts. The driver
+    /// publishes no range for rail offsets; the bound is deliberately tight
+    /// because the only measured effect of +20 mV on MSVDD was a lower XBAR
+    /// clock, and it did not prevent the +450 MHz lockup. Rail 0 (NVVDD slot)
+    /// accepts writes but has shown no measurable effect: experimental.
+    fn rm_rail_offset(&self, block: &ControlBlock, rail: usize) -> Option<NvidiaClockOffset> {
         let domain = self.rm_domain(RmDomainKind::Xbar)?;
         Some(NvidiaClockOffset {
-            current: block.rail_offset_uv(domain.index, MSVDD_RAIL) / 1000,
+            current: block.rail_offset_uv(domain.index, rail) / 1000,
             min: -50,
             max: 50,
         })
@@ -252,6 +253,7 @@ impl NvidiaGpuController {
                 || clocks.sys_clock_offset.is_some()
                 || clocks.video_clock_offset.is_some()
                 || clocks.msvdd_offset.is_some()
+                || clocks.nvvdd_offset.is_some()
             {
                 bail!("RM clock domain controls are not available on this driver");
             }
@@ -278,14 +280,21 @@ impl NvidiaGpuController {
             }
             wanted.set_freq_offset_khz(domain.index, mhz * 1000);
         }
-        if let Some(domain) = self.rm_domain(RmDomainKind::Xbar) {
-            let mv = clocks.msvdd_offset.unwrap_or(0);
-            if mv.abs() > 50 {
-                bail!("MSVDD offset {mv} mV exceeds the ±50 mV bound");
+        for (rail, mv, name) in [
+            (MSVDD_RAIL, clocks.msvdd_offset, "MSVDD"),
+            (0, clocks.nvvdd_offset, "NVVDD"),
+        ] {
+            let mv = mv.unwrap_or(0);
+            match self.rm_domain(RmDomainKind::Xbar) {
+                Some(domain) => {
+                    if mv.abs() > 50 {
+                        bail!("{name} offset {mv} mV exceeds the ±50 mV bound");
+                    }
+                    wanted.set_rail_offset_uv(domain.index, rail, mv * 1000);
+                }
+                None if mv != 0 => bail!("{name} offset requires an adjustable XBAR domain"),
+                None => {}
             }
-            wanted.set_rail_offset_uv(domain.index, MSVDD_RAIL, mv * 1000);
-        } else if clocks.msvdd_offset.is_some_and(|mv| mv != 0) {
-            bail!("MSVDD offset requires an adjustable XBAR domain");
         }
 
         if wanted.freq_offset_khz(0) == current.freq_offset_khz(0)
@@ -1059,6 +1068,13 @@ impl GpuController for NvidiaGpuController {
         .into_iter()
         .filter_map(|(name, value)| Some((name.to_owned(), u64::from(value.ok()?))))
         .collect::<IndexMap<String, u64>>();
+        // RM-measured domains NVML does not report; the graphs window plots
+        // every entry of this map, so this is what makes XBAR graphable.
+        for (name, kind) in [("XBAR", RmDomainKind::Xbar), ("SYS", RmDomainKind::Sys)] {
+            if let Some(mhz) = self.rm_measure_mhz(kind) {
+                extra_clocks.insert(name.to_owned(), mhz);
+            }
+        }
 
         let mut voltage = None;
 
@@ -1354,7 +1370,10 @@ impl GpuController for NvidiaGpuController {
             video_offset: rm_block
                 .as_ref()
                 .and_then(|b| self.rm_freq_offset(b, RmDomainKind::Video)),
-            msvdd_offset: rm_block.as_ref().and_then(|b| self.rm_msvdd_offset(b)),
+            msvdd_offset: rm_block
+                .as_ref()
+                .and_then(|b| self.rm_rail_offset(b, MSVDD_RAIL)),
+            nvvdd_offset: rm_block.as_ref().and_then(|b| self.rm_rail_offset(b, 0)),
             rm_clock_domains: rm_block
                 .as_ref()
                 .map(|b| self.rm_domain_table(b))

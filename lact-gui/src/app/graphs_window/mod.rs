@@ -49,6 +49,10 @@ pub enum GraphsWindowMsg {
     SwapPlots(DynamicIndex, DynamicIndex),
     RemovePlot(DynamicIndex),
     AddPlot,
+    /// Ensure a plot showing all of these stats exists, then show the window
+    ShowStats(Vec<StatType>),
+    /// Remove every plot whose stats are exactly this set
+    RemoveStats(Vec<StatType>),
     SetConfig(Vec<Vec<StatType>>),
     SaveConfig,
     Show,
@@ -251,6 +255,44 @@ impl relm4::Component for GraphsWindow {
             GraphsWindowMsg::RemovePlot(index) => {
                 self.plots.guard().remove(index.current_index());
                 sender.input(GraphsWindowMsg::SaveConfig);
+            }
+            GraphsWindowMsg::RemoveStats(stats) => {
+                let indices: Vec<usize> = self
+                    .plots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, plot)| {
+                        let selected = plot.selected_stats();
+                        selected.len() == stats.len()
+                            && stats.iter().all(|stat| selected.contains(stat))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if !indices.is_empty() {
+                    let mut guard = self.plots.guard();
+                    for i in indices.into_iter().rev() {
+                        guard.remove(i);
+                    }
+                    drop(guard);
+                    sender.input(GraphsWindowMsg::SaveConfig);
+                }
+            }
+            GraphsWindowMsg::ShowStats(stats) => {
+                let exists = self.plots.iter().any(|plot| {
+                    let selected = plot.selected_stats();
+                    stats.iter().all(|stat| selected.contains(stat))
+                });
+                if !exists {
+                    self.plots.guard().push_back(PlotComponentConfig {
+                        selected_stats: stats,
+                        data: self.stats_data.clone(),
+                        edit_mode: self.edit_mode.clone(),
+                        plots_per_row: self.plots_per_row.clone(),
+                        time_period: self.time_period_seconds_adj.clone(),
+                    });
+                    sender.input(GraphsWindowMsg::SaveConfig);
+                }
+                sender.input(GraphsWindowMsg::Show);
             }
             GraphsWindowMsg::AddPlot => {
                 self.plots.guard().push_back(PlotComponentConfig {

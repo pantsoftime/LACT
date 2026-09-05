@@ -519,6 +519,9 @@ pub struct NvidiaClocksTable {
     /// MSVDD rail offset on the XBAR domain, millivolts
     #[serde(default)]
     pub msvdd_offset: Option<NvidiaClockOffset>,
+    /// Rail-0 (NVVDD) offset on the XBAR domain, millivolts. Experimental.
+    #[serde(default)]
+    pub nvvdd_offset: Option<NvidiaClockOffset>,
     /// Every domain the RM ClockClient interface reports, for the live table
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rm_clock_domains: Vec<NvidiaRmClockDomain>,

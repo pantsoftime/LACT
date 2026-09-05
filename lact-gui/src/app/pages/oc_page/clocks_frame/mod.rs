@@ -756,6 +756,7 @@ fn clock_title(clock_type: ClockspeedType) -> String {
         ClockspeedType::SysClockOffset => "SYS clock offset".to_owned(),
         ClockspeedType::VideoClockOffset => "Video clock offset".to_owned(),
         ClockspeedType::MsvddOffset => "MSVDD offset".to_owned(),
+        ClockspeedType::NvvddOffset => "NVVDD offset".to_owned(),
         ClockspeedType::Reset => unreachable!(),
     }
 }

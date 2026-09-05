@@ -46,7 +46,8 @@ impl ClockCategory {
             ClockspeedType::XbarClockOffset
             | ClockspeedType::SysClockOffset
             | ClockspeedType::VideoClockOffset
-            | ClockspeedType::MsvddOffset => ClockCategory::RmDomain,
+            | ClockspeedType::MsvddOffset
+            | ClockspeedType::NvvddOffset => ClockCategory::RmDomain,
             ClockspeedType::Reset => unreachable!(),
         }
     }
@@ -202,7 +203,8 @@ fn get_row_step(clock_type: ClockspeedType) -> f64 {
         ClockCategory::CoreClock
         | ClockCategory::VramClock
         | ClockCategory::CoreCurveClock
-        | ClockCategory::VramCurveClock => 5.0,
+        | ClockCategory::VramCurveClock
+        | ClockCategory::RmDomain => 5.0,
         ClockCategory::CoreVoltage
         | ClockCategory::CoreCurveVoltage
         | ClockCategory::VramCurveVoltage => 1.0,

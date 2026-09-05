@@ -104,6 +104,8 @@ pub struct ClocksConfiguration {
     pub video_clock_offset: Option<i32>,
     /// NVIDIA-only: MSVDD rail offset on the XBAR domain, in millivolts.
     pub msvdd_offset: Option<i32>,
+    /// NVIDIA-only, experimental: rail-0 offset on the XBAR domain, millivolts.
+    pub nvvdd_offset: Option<i32>,
 }
 
 impl ClocksConfiguration {
@@ -150,6 +152,7 @@ impl ClocksConfiguration {
             ClockspeedType::SysClockOffset => self.sys_clock_offset = value,
             ClockspeedType::VideoClockOffset => self.video_clock_offset = value,
             ClockspeedType::MsvddOffset => self.msvdd_offset = value,
+            ClockspeedType::NvvddOffset => self.nvvdd_offset = value,
             ClockspeedType::Reset => {
                 *self = ClocksConfiguration::default();
             }
