@@ -514,17 +514,25 @@ impl TestRunner {
         let venv = Self::venv(&tools_dir);
         let available = tools_dir.join("xbar_verify.py").is_file();
 
+        // Only directory names on the visible line: full paths belong in the
+        // tooltip, not in every screenshot of the page.
+        let short = |p: &std::path::Path| {
+            p.file_name()
+                .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
+        };
+        let venv_short = std::path::Path::new(&venv)
+            .ancestors()
+            .nth(2)
+            .map_or_else(|| venv.clone(), short);
         let status = gtk::Label::builder()
             .xalign(0.0)
             .wrap(true)
             .label(&if available {
-                format!("Idle   ·   tooling {}   ·   venv {venv}", tools_dir.display())
+                format!("Idle   ·   tooling {}   ·   venv {venv_short}", short(&tools_dir))
             } else {
-                format!(
-                    "Tooling not found at {} (set {TOOLS_DIR_ENV})",
-                    tools_dir.display()
-                )
+                format!("Tooling not found (set {TOOLS_DIR_ENV})")
             })
+            .tooltip_text(&format!("Tooling directory: {}\nPython: {venv}", tools_dir.display()))
             .css_classes(["caption", "dim-label"])
             .build();
         let buffer = gtk::TextBuffer::new(None);
