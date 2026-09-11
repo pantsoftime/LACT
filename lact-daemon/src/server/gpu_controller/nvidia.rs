@@ -255,7 +255,14 @@ impl NvidiaGpuController {
                 || clocks.msvdd_offset.is_some()
                 || clocks.nvvdd_offset.is_some()
             {
-                bail!("RM clock domain controls are not available on this driver");
+                // Non-fatal, like voltage boost: after a driver update the
+                // branch gate disables the RM controls, and a stale offset in
+                // the config must not stop fan, thermal and power settings
+                // from being applied. The Advanced page shows the RM status.
+                warn!(
+                    "RM clock domain offsets in the config were not applied: the ClockClient \
+                     interface is not available on this driver"
+                );
             }
             return Ok(());
         };

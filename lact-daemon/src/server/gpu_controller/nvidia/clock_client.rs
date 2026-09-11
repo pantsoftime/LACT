@@ -55,7 +55,10 @@ const RAIL_COUNT: usize = 4;
 pub const MSVDD_RAIL: usize = 1;
 
 /// Driver branches the layout above has been verified against.
-const VERIFIED_DRIVER_BRANCHES: &[&str] = &["610"];
+// 615 verified 2026-09-11 on GB202: GET_INFO byte-identical to 610, index->bit
+// map and rail slots reproduced by underclock probes under load, writes
+// readback-verified.
+const VERIFIED_DRIVER_BRANCHES: &[&str] = &["610", "615"];
 
 /// `apiDomain` selector values as identified on GB202 / 610.57.04.
 const API_DOMAIN_GPC: u32 = 0x0000_0001;

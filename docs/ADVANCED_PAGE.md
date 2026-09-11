@@ -7,7 +7,7 @@ the **MSVDD** / **NVVDD** voltage-rail offsets on the XBAR domain, next to the
 NVML-backed controls LACT already has (core and memory offsets, power limit,
 voltage boost, locked core clock).
 
-Developed and verified on an RTX 5090 (GB202) with driver **610.57.04**.
+Developed and verified on an RTX 5090 (GB202) with drivers **610.57.04** and **615.71.09** (identical private layout and domain map).
 
 ## How it works
 
@@ -18,7 +18,10 @@ uses for other queries. The control-block layout is **not in the public
 headers** and is **driver-branch specific**. The daemon therefore:
 
 - only enables the interface on driver branches it has been verified against
-  (R610 today), and refuses otherwise with a warning in the log;
+  (R610 and R615 today), and refuses otherwise with a warning in the log. RM offsets
+  left in the config from a verified branch are then skipped with a warning
+  instead of failing the profile, so fan, thermal and power settings still
+  apply after a driver update;
 - checks the `GET_INFO` / `GET_CONTROL` entry layout before touching anything;
 - resolves domains by their `apiDomain` selector rather than by index — the
   index-to-domain map is **not** an identity (on GB202: index 2 is memory,
