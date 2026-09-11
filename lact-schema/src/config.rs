@@ -102,10 +102,65 @@ pub struct ClocksConfiguration {
     pub xbar_clock_offset: Option<i32>,
     pub sys_clock_offset: Option<i32>,
     pub video_clock_offset: Option<i32>,
-    /// NVIDIA-only: MSVDD rail offset on the XBAR domain, in millivolts.
+    /// NVIDIA-only: MSVDD voltage demand offset of the XBAR domain, millivolts.
     pub msvdd_offset: Option<i32>,
-    /// NVIDIA-only, experimental: rail-0 offset on the XBAR domain, millivolts.
+    /// NVIDIA-only: NVVDD voltage demand offset of the GPC (core) domain, millivolts.
     pub nvvdd_offset: Option<i32>,
+    /// NVIDIA-only: voltage demand offsets of the SYS and video domains, millivolts.
+    pub sys_voltage_offset: Option<i32>,
+    pub video_voltage_offset: Option<i32>,
+    /// NVIDIA-only: GPC→XBAR clock propagation ratio × 1000 (900 = 0.900).
+    /// `None` = the factory relation.
+    pub gpc_xbar_ratio_milli: Option<i32>,
+    /// NVIDIA-only: voltage-policy limit deltas per rail, millivolts, written
+    /// as absolute values into the rail control object (`None` = the value
+    /// the daemon found at start, i.e. the firmware default unless a delta
+    /// was left applied across a daemon restart).
+    pub nvvdd_vmin_delta_mv: Option<i32>,
+    pub nvvdd_rel_delta_mv: Option<i32>,
+    pub nvvdd_alt_rel_delta_mv: Option<i32>,
+    pub nvvdd_ov_delta_mv: Option<i32>,
+    pub msvdd_vmin_delta_mv: Option<i32>,
+    pub msvdd_rel_delta_mv: Option<i32>,
+    pub msvdd_alt_rel_delta_mv: Option<i32>,
+    pub msvdd_ov_delta_mv: Option<i32>,
+}
+
+impl ClocksConfiguration {
+    pub fn rail_limit_delta(&self, rail: u8, limit: crate::RailLimit) -> Option<i32> {
+        use crate::RailLimit::*;
+        match (rail, limit) {
+            (0, Vmin) => self.nvvdd_vmin_delta_mv,
+            (0, Rel) => self.nvvdd_rel_delta_mv,
+            (0, AltRel) => self.nvvdd_alt_rel_delta_mv,
+            (0, Ov) => self.nvvdd_ov_delta_mv,
+            (1, Vmin) => self.msvdd_vmin_delta_mv,
+            (1, Rel) => self.msvdd_rel_delta_mv,
+            (1, AltRel) => self.msvdd_alt_rel_delta_mv,
+            (1, Ov) => self.msvdd_ov_delta_mv,
+            _ => None,
+        }
+    }
+
+    pub fn set_rail_limit_delta(&mut self, rail: u8, limit: crate::RailLimit, value: Option<i32>) {
+        use crate::RailLimit::*;
+        let slot = match (rail, limit) {
+            (0, Vmin) => &mut self.nvvdd_vmin_delta_mv,
+            (0, Rel) => &mut self.nvvdd_rel_delta_mv,
+            (0, AltRel) => &mut self.nvvdd_alt_rel_delta_mv,
+            (0, Ov) => &mut self.nvvdd_ov_delta_mv,
+            (1, Vmin) => &mut self.msvdd_vmin_delta_mv,
+            (1, Rel) => &mut self.msvdd_rel_delta_mv,
+            (1, AltRel) => &mut self.msvdd_alt_rel_delta_mv,
+            (1, Ov) => &mut self.msvdd_ov_delta_mv,
+            _ => return,
+        };
+        *slot = value;
+    }
+
+    pub fn any_rail_limit_delta(&self) -> bool {
+        (0..2u8).any(|rail| crate::RailLimit::ALL.iter().any(|l| self.rail_limit_delta(rail, *l).is_some()))
+    }
 }
 
 impl ClocksConfiguration {
@@ -153,6 +208,10 @@ impl ClocksConfiguration {
             ClockspeedType::VideoClockOffset => self.video_clock_offset = value,
             ClockspeedType::MsvddOffset => self.msvdd_offset = value,
             ClockspeedType::NvvddOffset => self.nvvdd_offset = value,
+            ClockspeedType::SysVoltageOffset => self.sys_voltage_offset = value,
+            ClockspeedType::VideoVoltageOffset => self.video_voltage_offset = value,
+            ClockspeedType::GpcXbarRatioMilli => self.gpc_xbar_ratio_milli = value,
+            ClockspeedType::RailLimitDelta(rail, limit) => self.set_rail_limit_delta(rail, limit, value),
             ClockspeedType::Reset => {
                 *self = ClocksConfiguration::default();
             }

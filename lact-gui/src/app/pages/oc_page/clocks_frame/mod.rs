@@ -757,6 +757,12 @@ fn clock_title(clock_type: ClockspeedType) -> String {
         ClockspeedType::VideoClockOffset => "Video clock offset".to_owned(),
         ClockspeedType::MsvddOffset => "MSVDD offset".to_owned(),
         ClockspeedType::NvvddOffset => "NVVDD offset".to_owned(),
+        ClockspeedType::SysVoltageOffset => "SYS voltage offset".to_owned(),
+        ClockspeedType::VideoVoltageOffset => "Video voltage offset".to_owned(),
+        ClockspeedType::GpcXbarRatioMilli => "GPC→XBAR ratio (×1000)".to_owned(),
+        ClockspeedType::RailLimitDelta(rail, limit) => {
+            format!("Rail {rail} {} limit delta", limit.label())
+        }
         ClockspeedType::Reset => unreachable!(),
     }
 }

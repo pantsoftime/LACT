@@ -22,17 +22,20 @@ use crate::app::pages::PageUpdate;
 use gtk::prelude::*;
 use lact_schema::config::GpuConfig;
 use lact_schema::request::{ClockspeedType, SetClocksCommand};
-use lact_schema::{ClocksTable, DeviceStats, NvidiaClockOffset, NvidiaClocksTable};
+use lact_schema::{
+    ClocksTable, DeviceStats, NvidiaClockOffset, NvidiaClocksTable, NvidiaVoltageRail, RailLimit,
+};
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
 /// Highest XBAR offset the correctness harness has passed on the reference
 /// card. Going above it needs the explicit switch on the page.
 const VALIDATED_MAX_XBAR_MHZ: f64 = 300.0;
-/// Wrap width for card text, which is what keeps three cards to a row.
-const CARD_TEXT_CHARS: i32 = 34;
+/// Requested width of card text; every card asks for the same width so the
+/// grid stays aligned, and it is what sets how many cards fit a row.
+const CARD_TEXT_CHARS: i32 = 26;
 
 #[derive(Debug)]
 pub enum AdvVoltagePageMsg {
@@ -59,6 +62,9 @@ enum Control {
     PowerCap,
     /// Locked core clock: `min_core_clock = max_core_clock = v`.
     BoostLock,
+    /// GPC→XBAR propagation ratio; the card edits the ratio, the config
+    /// stores it × 1000.
+    Ratio,
 }
 
 /// One editable card: title, enable switch, spin + slider on a shared
@@ -82,6 +88,7 @@ impl Card {
         title: &str,
         unit: &'static str,
         step: f64,
+        digits: u32,
         control: Control,
         note: &str,
         warning: bool,
@@ -99,8 +106,8 @@ impl Card {
         let current_label = caption("Current: —", false);
         let spin = gtk::SpinButton::builder()
             .adjustment(&adjustment)
-            .digits(0)
-            .width_chars(6)
+            .digits(digits)
+            .width_chars(if digits > 0 { 7 } else { 6 })
             .build();
         let scale = gtk::Scale::builder()
             .adjustment(&adjustment)
@@ -122,18 +129,22 @@ impl Card {
         row.append(&default_button);
         row.set_sensitive(false);
 
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         header.append(&heading(title));
+        header.append(&info_icon(note, warning));
         header.append(&switch);
 
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 5);
-        body.set_margin_all(10);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        body.set_margin_all(8);
         body.append(&header);
         body.append(&current_label);
         body.append(&row);
-        body.append(&caption(note, warning));
 
-        let frame = gtk::Frame::builder().child(&body).hexpand(true).build();
+        let frame = gtk::Frame::builder()
+            .child(&body)
+            .hexpand(true)
+            .valign(gtk::Align::Start)
+            .build();
 
         {
             let (sender, dirty, loading) = (sender.clone(), dirty.clone(), loading.clone());
@@ -247,6 +258,213 @@ impl Card {
                 clocks.min_core_clock = v;
                 clocks.max_core_clock = v;
             }
+            Control::Ratio => {
+                #[allow(clippy::cast_possible_truncation)]
+                let milli = self
+                    .switch
+                    .is_active()
+                    .then(|| (self.adjustment.value() * 1000.0).round() as i32);
+                clocks.gpc_xbar_ratio_milli = milli;
+            }
+        }
+        self.dirty.set(false);
+    }
+}
+
+/// One voltage rail: live target / sensed voltage and evaluated limits on
+/// two lines, then the four policy-limit deltas (VMIN, REL, ALT/OP, OV) as
+/// slider rows. Off = the deltas the daemon found at start (the firmware
+/// defaults, e.g. −50 mV REL on MSVDD). The driver's evaluated MAX — the
+/// tightest of REL / ALT / OV — is what binds.
+///
+/// Taller than the other cards, so it lives in its own row: put in a
+/// homogeneous grid with them it would set the height of every cell.
+struct RailCard {
+    frame: gtk::Frame,
+    switch: gtk::Switch,
+    live: gtk::Label,
+    limits_label: gtk::Label,
+    adjustments: [(RailLimit, gtk::Adjustment); 4],
+    rail: u8,
+    defaults: Rc<RefCell<[i32; 4]>>,
+    dirty: Rc<Cell<bool>>,
+    loading: Rc<Cell<bool>>,
+}
+
+impl RailCard {
+    fn new(title: &str, rail: u8, note: &str, sender: &ComponentSender<AdvVoltagePage>) -> Self {
+        let dirty = Rc::new(Cell::new(false));
+        let loading = Rc::new(Cell::new(false));
+        let defaults = Rc::new(RefCell::new([0i32; 4]));
+        let switch = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .tooltip_text("On: the deltas below are applied. Off: the values found at daemon start.")
+            .build();
+        let live = gtk::Label::builder()
+            .label("—")
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let limits_label = gtk::Label::builder()
+            .label("—")
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption", "dim-label"])
+            .build();
+
+        let grid = gtk::Grid::builder().column_spacing(6).row_spacing(2).build();
+        let adjustments = RailLimit::ALL.map(|limit| {
+            let adjustment = gtk::Adjustment::new(0.0, -250.0, 250.0, 5.0, 25.0, 0.0);
+            (limit, adjustment)
+        });
+        for (row, (limit, adjustment)) in adjustments.iter().enumerate() {
+            let label = gtk::Label::builder()
+                .label(limit.label())
+                .xalign(0.0)
+                .width_chars(7)
+                .tooltip_text(limit_note(*limit))
+                .css_classes(["caption"])
+                .build();
+            let spin = gtk::SpinButton::builder()
+                .adjustment(adjustment)
+                .digits(0)
+                .width_chars(6)
+                .build();
+            let scale = gtk::Scale::builder()
+                .adjustment(adjustment)
+                .orientation(gtk::Orientation::Horizontal)
+                .hexpand(true)
+                .draw_value(false)
+                .build();
+            scale.add_mark(0.0, gtk::PositionType::Bottom, None);
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            let row = row as i32;
+            grid.attach(&label, 0, row, 1, 1);
+            grid.attach(&spin, 1, row, 1, 1);
+            grid.attach(&scale, 2, row, 1, 1);
+            let (sender, dirty, loading) = (sender.clone(), dirty.clone(), loading.clone());
+            adjustment.connect_value_changed(move |_| {
+                if loading.get() {
+                    return;
+                }
+                dirty.set(true);
+                let _ = sender.output(AppMsg::SettingsChanged);
+            });
+        }
+        let default_button = gtk::Button::builder()
+            .label("Default")
+            .css_classes(["flat"])
+            .halign(gtk::Align::End)
+            .tooltip_text("Reset the deltas to the values found at daemon start")
+            .build();
+        grid.attach(&default_button, 2, 4, 1, 1);
+        grid.set_sensitive(false);
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.append(&heading(title));
+        header.append(&info_icon(note, true));
+        header.append(&switch);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        body.set_margin_all(8);
+        body.append(&header);
+        body.append(&live);
+        body.append(&limits_label);
+        body.append(&grid);
+        let frame = gtk::Frame::builder().child(&body).hexpand(true).build();
+
+        {
+            let (sender, dirty, loading, grid) =
+                (sender.clone(), dirty.clone(), loading.clone(), grid.clone());
+            switch.connect_active_notify(move |switch| {
+                grid.set_sensitive(switch.is_active());
+                if loading.get() {
+                    return;
+                }
+                dirty.set(true);
+                let _ = sender.output(AppMsg::SettingsChanged);
+            });
+        }
+        {
+            let (adjustments, defaults) = (adjustments.clone(), defaults.clone());
+            default_button.connect_clicked(move |_| {
+                for (i, (_, adjustment)) in adjustments.iter().enumerate() {
+                    adjustment.set_value(f64::from(defaults.borrow()[i]));
+                }
+            });
+        }
+
+        Self {
+            frame,
+            switch,
+            live,
+            limits_label,
+            adjustments,
+            rail,
+            defaults,
+            dirty,
+            loading,
+        }
+    }
+
+    fn load(&self, rail: &NvidiaVoltageRail) {
+        self.live.set_label(&format!(
+            "Target {} mV{}   ·   device max {}",
+            rail.target_mv,
+            rail.sensed_mv
+                .map_or(String::new(), |s| format!(", sensed {s} mV")),
+            rail.device_max_mv
+                .map_or("—".to_owned(), |m| format!("{m} mV")),
+        ));
+        self.limits_label.set_label(&format!(
+            "VMIN {} · REL {} · ALT/OP {} · OV {}   →   MAX {} mV",
+            rail.vmin_limit_mv,
+            rail.rel_limit_mv,
+            rail.alt_rel_limit_mv,
+            rail.ov_limit_mv,
+            rail.max_limit_mv
+        ));
+        if self.dirty.get() {
+            return;
+        }
+        self.loading.set(true);
+        let mut any_off_default = false;
+        let mut defaults = [0i32; 4];
+        for (i, (limit, adjustment)) in self.adjustments.iter().enumerate() {
+            if let Some(d) = rail.limit_deltas.iter().find(|d| d.limit == *limit) {
+                adjustment.set_lower(f64::from(d.min_mv));
+                adjustment.set_upper(f64::from(d.max_mv));
+                adjustment.set_value(f64::from(d.current_mv));
+                defaults[i] = d.default_mv;
+                any_off_default |= d.current_mv != d.default_mv;
+            }
+        }
+        *self.defaults.borrow_mut() = defaults;
+        self.switch.set_active(any_off_default);
+        self.frame.set_sensitive(!rail.limit_deltas.is_empty());
+        self.loading.set(false);
+    }
+
+    fn unavailable(&self, reason: &str) {
+        self.loading.set(true);
+        self.switch.set_active(false);
+        self.live.set_label(reason);
+        self.limits_label.set_label("—");
+        self.frame.set_sensitive(false);
+        self.loading.set(false);
+    }
+
+    fn apply(&self, config: &mut GpuConfig) {
+        if !self.dirty.get() {
+            return;
+        }
+        let on = self.switch.is_active();
+        for (limit, adjustment) in &self.adjustments {
+            #[allow(clippy::cast_possible_truncation)]
+            let value = on.then(|| adjustment.value().round() as i32);
+            config
+                .clocks_configuration
+                .set_rail_limit_delta(self.rail, *limit, value);
         }
         self.dirty.set(false);
     }
@@ -265,11 +483,15 @@ fn heading(text: &str) -> gtk::Label {
         .build()
 }
 
+/// Card text. Requests a fixed width (not just a maximum) so a value that
+/// changes length — "975" to "1020" — never changes what the homogeneous
+/// grid asks for; that was what made the page jump.
 fn caption(text: &str, warning: bool) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
         .xalign(0.0)
         .wrap(true)
+        .width_chars(CARD_TEXT_CHARS)
         .max_width_chars(CARD_TEXT_CHARS)
         .css_classes(if warning {
             ["caption", "warning"]
@@ -277,6 +499,30 @@ fn caption(text: &str, warning: bool) -> gtk::Label {
             ["caption", "dim-label"]
         })
         .build()
+}
+
+/// The card's explanation, on hover, instead of a paragraph under every
+/// card (mVolt+ 0.40 does the same with its tooltips).
+fn info_icon(note: &str, warning: bool) -> gtk::Image {
+    gtk::Image::builder()
+        .icon_name(if warning {
+            "dialog-warning-symbolic"
+        } else {
+            "dialog-information-symbolic"
+        })
+        .tooltip_text(note)
+        .valign(gtk::Align::Center)
+        .css_classes(if warning { ["warning"] } else { ["dim-label"] })
+        .build()
+}
+
+fn limit_note(limit: RailLimit) -> &'static str {
+    match limit {
+        RailLimit::Vmin => "Delta to the rail's minimum-voltage floor. Raising it holds the rail higher at idle (more idle power); lowering it lets it sag further.",
+        RailLimit::Rel => "Delta to the reliability limit, normally the binding maximum (MAX = tightest of REL / ALT-OP / OV). −50 mV is the driver default on MSVDD here. Raising it alone does nothing while ALT/OP or OV is tighter.",
+        RailLimit::AltRel => "Delta to the alternate-reliability / operating limit (Vop). The vendor's operating ceiling; going above it is XOC territory.",
+        RailLimit::Ov => "Delta to the overvoltage ceiling. Only matters once REL and ALT/OP are above it. Held under the device maximum by the daemon.",
+    }
 }
 
 fn section_label(text: &str) -> gtk::Label {
@@ -288,48 +534,18 @@ fn section_label(text: &str) -> gtk::Label {
         .build()
 }
 
+/// Uniform cells: every card is the same shape (title, current line, one
+/// slider row), so homogeneous costs nothing and keeps the grid aligned.
 fn card_grid() -> gtk::FlowBox {
     gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .min_children_per_line(2)
-        .max_children_per_line(3)
+        .max_children_per_line(4)
         .homogeneous(true)
-        .row_spacing(8)
-        .column_spacing(8)
+        .row_spacing(6)
+        .column_spacing(6)
         .hexpand(true)
         .build()
-}
-
-/// A control mVolt+ has that has no Linux mechanism yet: same shape as a
-/// card, permanently insensitive, reason in the tooltip. Returns the "live"
-/// label so real telemetry can still be shown on it.
-fn placeholder_card(title: &str, live: &str, why: &str) -> (gtk::Frame, gtk::Label) {
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    header.append(&heading(title));
-    header.append(&caption("Not wired", false));
-    let live_label = caption(live, false);
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.append(&gtk::SpinButton::with_range(0.0, 1.0, 1.0));
-    row.append(&gtk::Scale::with_range(
-        gtk::Orientation::Horizontal,
-        0.0,
-        1.0,
-        1.0,
-    ));
-    row.set_sensitive(false);
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 5);
-    body.set_margin_all(10);
-    body.append(&header);
-    body.append(&live_label);
-    body.append(&row);
-    body.append(&caption(why, false));
-    let frame = gtk::Frame::builder()
-        .child(&body)
-        .hexpand(true)
-        .tooltip_text(why)
-        .build();
-    frame.add_css_class("dim-label");
-    (frame, live_label)
 }
 
 /// A telemetry tile. Left-click opens the graphs window on a plot of the
@@ -344,9 +560,14 @@ fn tele_tile(
     stats: Vec<StatType>,
     sender: &ComponentSender<AdvVoltagePage>,
 ) -> (gtk::Box, gtk::Label) {
+    // Fixed width: the tiles are homogeneous, so a value growing from
+    // "895 MHz" to "3135 MHz" used to widen every tile and shift the page.
     let value = gtk::Label::builder()
         .label("—")
         .xalign(0.0)
+        .width_chars(13)
+        .max_width_chars(13)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["title-3", "numeric"])
         .build();
     // Explicit menu button: nothing can intercept it, unlike a right-click
@@ -374,8 +595,12 @@ fn tele_tile(
         .build();
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    let name_label = caption(name, false);
-    name_label.set_hexpand(true);
+    let name_label = gtk::Label::builder()
+        .label(name)
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(["caption", "dim-label"])
+        .build();
     header.append(&name_label);
     header.append(&menu_button);
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -445,11 +670,15 @@ pub struct AdvVoltagePage {
     msvdd: Card,
     sys: Card,
     video: Card,
+    sys_volt: Card,
+    video_volt: Card,
+    ratio: Card,
     mem: Card,
     power: Card,
 
-    nvvdd_range_live: gtk::Label,
-    ratio_live: gtk::Label,
+    nvvdd_rail: RailCard,
+    msvdd_rail: RailCard,
+    tele_msvdd: gtk::Label,
     guard_switch: gtk::Switch,
     table: Option<NvidiaClocksTable>,
 }
@@ -492,7 +721,7 @@ impl relm4::Component for AdvVoltagePage {
         let tele = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         tele.set_homogeneous(true);
         let mut tiles = Vec::new();
-        let specs: [(&str, Vec<StatType>); 8] = [
+        let specs: [(&str, Vec<StatType>); 9] = [
             ("GPC", vec![StatType::GpuClock]),
             ("XBAR", vec![StatType::Clockspeed("XBAR".into())]),
             ("SYS", vec![StatType::Clockspeed("SYS".into())]),
@@ -503,6 +732,13 @@ impl relm4::Component for AdvVoltagePage {
                 vec![StatType::GpuClock, StatType::Clockspeed("XBAR".into())],
             ),
             ("Core V", vec![StatType::GpuVoltage]),
+            (
+                "MSVDD V",
+                vec![
+                    StatType::Voltage("MSVDD".into()),
+                    StatType::Voltage("MSVDD target".into()),
+                ],
+            ),
             (
                 "Power",
                 vec![
@@ -524,7 +760,8 @@ impl relm4::Component for AdvVoltagePage {
             tiles.next().unwrap(),
             tiles.next().unwrap(),
         );
-        let (tele_mem, tele_ratio, tele_volt, tele_power) = (
+        let (tele_mem, tele_ratio, tele_volt, tele_msvdd, tele_power) = (
+            tiles.next().unwrap(),
             tiles.next().unwrap(),
             tiles.next().unwrap(),
             tiles.next().unwrap(),
@@ -539,6 +776,7 @@ impl relm4::Component for AdvVoltagePage {
             "Core clock offset",
             "MHz",
             5.0,
+            0,
             Control::CoreOffset,
             "NVML VF offset — the register nvidia-smi and the Overclocking page use. Written for pstate 0 only; other pstate entries are cleared because a stray 0 cancels the value on this driver.",
             false,
@@ -548,6 +786,7 @@ impl relm4::Component for AdvVoltagePage {
             "Boost lock",
             "MHz",
             15.0,
+            0,
             Control::BoostLock,
             "Locks the core clock (NVML locked clocks, min = max = target; the same as nvidia-smi -lgc). Off restores boost.",
             false,
@@ -557,32 +796,23 @@ impl relm4::Component for AdvVoltagePage {
             "Voltage boost",
             "%",
             5.0,
+            0,
             Control::Clock(ClockspeedType::VoltageBoost),
             "LACT's bounded V/F limit shift via NVAPI (PR #1133). Same control as the Overclocking page.",
             false,
             &sender,
         );
         let nvvdd = Card::new(
-            "Core voltage offset (NVVDD)",
+            "Core voltage offset (NVVDD demand)",
             "mV",
             5.0,
+            0,
             Control::Clock(ClockspeedType::NvvddOffset),
-            "Experimental. Rail 0 on the XBAR domain accepts writes but produced no measurable clock change in testing. Bounded ±50 mV.",
+            "The GPC domain's voltage demand on its own rail (rail 0, from the driver's rail mask). Another domain or a limit can still win the rail. Bounded ±50 mV; untested at any value.",
             true,
             &sender,
         );
-        let (nvvdd_range, nvvdd_range_live) = placeholder_card(
-            "NVVDD voltage range",
-            "Live core voltage: —",
-            "mVolt+ sets a min/max window through NVAPI. No Linux path found yet; the live voltage comes from LACT's NvAPI readout.",
-        );
-        for f in [
-            &core.frame,
-            &boost_lock.frame,
-            &vboost.frame,
-            &nvvdd.frame,
-            &nvvdd_range,
-        ] {
+        for f in [&core.frame, &boost_lock.frame, &vboost.frame, &nvvdd.frame] {
             grid.append(f);
         }
         content.append(&grid);
@@ -594,6 +824,7 @@ impl relm4::Component for AdvVoltagePage {
             "XBAR clock offset",
             "MHz",
             10.0,
+            0,
             Control::Clock(ClockspeedType::XbarClockOffset),
             "Verified by readback and CLK_MEASURE_FREQ. Harness-validated to +300; above that needs the guard switch below.",
             false,
@@ -603,6 +834,7 @@ impl relm4::Component for AdvVoltagePage {
             "XBAR voltage offset (MSVDD)",
             "mV",
             5.0,
+            0,
             Control::Clock(ClockspeedType::MsvddOffset),
             "+20 mV lowered XBAR ~31 MHz on its own and did not extend the ceiling. Not free headroom.",
             true,
@@ -612,6 +844,7 @@ impl relm4::Component for AdvVoltagePage {
             "SYS clock offset",
             "MHz",
             10.0,
+            0,
             Control::Clock(ClockspeedType::SysClockOffset),
             "Domain verified. Not harness-validated at any positive value.",
             false,
@@ -621,32 +854,74 @@ impl relm4::Component for AdvVoltagePage {
             "Video clock offset",
             "MHz",
             10.0,
+            0,
             Control::Clock(ClockspeedType::VideoClockOffset),
             "NVENC / NVDEC only. Verified domain; not harness-validated.",
             false,
             &sender,
         );
-        let (ratio_card, ratio_live) = placeholder_card(
-            "MSVDD clock ratio",
-            "Measured XBAR / GPC: —",
-            "mVolt+ sets the ceiling of the MSVDD-domain clocks as a ratio of core. That control has not been found on Linux; the measured ratio is real.",
+        let sys_volt = Card::new(
+            "SYS voltage offset (MSVDD demand)",
+            "mV",
+            5.0,
+            0,
+            Control::Clock(ClockspeedType::SysVoltageOffset),
+            "The SYS domain's voltage demand on the fabric rail. Same caveats as the XBAR demand. Untested at any value.",
+            true,
+            &sender,
         );
-        let (msvdd_range, _) = placeholder_card(
-            "MSVDD voltage range",
-            "No MSVDD voltage readback on this driver",
-            "NVAPI range control on Windows; no Linux path found yet.",
+        let video_volt = Card::new(
+            "Video voltage offset (MSVDD demand)",
+            "mV",
+            5.0,
+            0,
+            Control::Clock(ClockspeedType::VideoVoltageOffset),
+            "The video domain's voltage demand on the fabric rail. NVENC / NVDEC only. Untested at any value.",
+            true,
+            &sender,
+        );
+        let ratio = Card::new(
+            "MSVDD clock ratio (GPC→XBAR propagation)",
+            "×",
+            0.005,
+            3,
+            Control::Ratio,
+            "The clock arbiter's GPC→XBAR propagation ratio (factory 0.900 on GB202). A constraint, not XBAR = GPC × ratio: XBAR and SYS follow the core higher when it binds. Off = factory. Not harness-validated at any value; 0.90–0.95 was another tester's adoption envelope, 1.20 raised XBAR 174 MHz in their A/B.",
+            true,
+            &sender,
         );
         for f in [
             &xbar.frame,
             &msvdd.frame,
             &sys.frame,
+            &sys_volt.frame,
             &video.frame,
-            &ratio_card,
-            &msvdd_range,
+            &video_volt.frame,
+            &ratio.frame,
         ] {
             grid.append(f);
         }
         content.append(&grid);
+
+        // ---- Voltage limits: the two tall cards share a row of their own
+        content.append(&section_label("Voltage limits"));
+        let rails_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        rails_row.set_homogeneous(true);
+        let nvvdd_rail = RailCard::new(
+            "NVVDD voltage limits",
+            0,
+            "Deltas (mV) to the core rail's voltage-policy limits. MAX = the tightest of REL / ALT-OP / OV is what binds; a raised limit is held under the device maximum. Not harness-validated at any value.",
+            &sender,
+        );
+        let msvdd_rail = RailCard::new(
+            "MSVDD voltage limits",
+            1,
+            "Deltas (mV) to the fabric rail's policy limits; −50 on REL is the driver default here. Finding 21: +30 mV here did not make XBAR +340 compute correctly, so this is not XBAR headroom on this card.",
+            &sender,
+        );
+        rails_row.append(&nvvdd_rail.frame);
+        rails_row.append(&msvdd_rail.frame);
+        content.append(&rails_row);
 
         // ---- Memory / Power
         content.append(&section_label("Memory / Power"));
@@ -655,6 +930,7 @@ impl relm4::Component for AdvVoltagePage {
             "Memory clock offset",
             "MHz",
             50.0,
+            0,
             Control::MemOffset,
             "NVML VF offset, pstate 0. GDDR7 errors can show as lower throughput rather than corruption — validate with throughput too.",
             false,
@@ -664,17 +940,15 @@ impl relm4::Component for AdvVoltagePage {
             "Power limit",
             "W",
             5.0,
+            0,
             Control::PowerCap,
             "Off = driver default. At the cap, extra voltage lowers clocks instead of raising power.",
             false,
             &sender,
         );
-        let (ext_volt, _) = placeholder_card(
-            "Extended voltage",
-            "—",
-            "mVolt+ extended voltage demand offsets per rail. No Linux path found.",
-        );
-        for f in [&mem.frame, &power.frame, &ext_volt] {
+        // mVolt+'s "extended voltage" is the same per-domain demand offsets
+        // above with a ±500 mV window; the ±50 mV bound here is deliberate.
+        for f in [&mem.frame, &power.frame] {
             grid.append(f);
         }
         content.append(&grid);
@@ -688,14 +962,17 @@ impl relm4::Component for AdvVoltagePage {
         guard_box.append(
             &gtk::Label::builder()
                 .label(&format!(
-                    "Allow XBAR above the validated maximum of +{VALIDATED_MAX_XBAR_MHZ:.0} MHz. \
-                     +380 MHz produced wrong compute results with no crash and no Xid; +450 MHz hard-locked the machine."
+                    "Allow XBAR above the validated +{VALIDATED_MAX_XBAR_MHZ:.0} MHz"
                 ))
                 .xalign(0.0)
-                .wrap(true)
                 .hexpand(true)
                 .build(),
         );
+        guard_box.append(&info_icon(
+            "+380 MHz produced wrong compute results with no crash and no Xid; +450 MHz hard-locked the machine. \
+             Anything above the validated maximum needs the correctness harness before daily use.",
+            true,
+        ));
         guard_box.append(
             &gtk::Button::builder()
                 .label("Run correctness check")
@@ -737,10 +1014,14 @@ impl relm4::Component for AdvVoltagePage {
             msvdd,
             sys,
             video,
+            sys_volt,
+            video_volt,
+            ratio,
             mem,
             power,
-            nvvdd_range_live,
-            ratio_live,
+            nvvdd_rail,
+            msvdd_rail,
+            tele_msvdd,
             guard_switch,
             table: None,
         };
@@ -781,16 +1062,20 @@ impl AdvVoltagePage {
             _ => "—".to_owned(),
         };
         self.tele_ratio.set_label(&ratio);
-        self.ratio_live
-            .set_label(&format!("Measured XBAR / GPC: {ratio}"));
 
         let volt = stats
             .voltage
             .gpu
             .map_or("—".to_owned(), |v| format!("{v} mV"));
         self.tele_volt.set_label(&volt);
-        self.nvvdd_range_live
-            .set_label(&format!("Live core voltage: {volt}"));
+        let sensors = &stats.voltage.sensors;
+        self.tele_msvdd
+            .set_label(&match (sensors.get("MSVDD"), sensors.get("MSVDD target")) {
+                (Some(s), Some(t)) => format!("{s} / {t} mV"),
+                (Some(s), None) => format!("{s} mV"),
+                (None, Some(t)) => format!("→ {t} mV"),
+                _ => "—".to_owned(),
+            });
 
         let p = &stats.power;
         let draw = p.average.or(p.current);
@@ -835,12 +1120,46 @@ impl AdvVoltagePage {
                 &self.msvdd,
                 &self.sys,
                 &self.video,
+                &self.sys_volt,
+                &self.video_volt,
+                &self.ratio,
                 &self.mem,
             ] {
                 card.unavailable("No NVIDIA clocks table from the daemon");
             }
+            self.nvvdd_rail.unavailable("No NVIDIA clocks table from the daemon");
+            self.msvdd_rail.unavailable("No NVIDIA clocks table from the daemon");
             return;
         };
+
+        match t.gpc_xbar_ratio {
+            Some(r) => self.ratio.load(
+                Some(r.current),
+                r.min,
+                r.max,
+                r.factory,
+                (r.current - r.factory).abs() > 0.0005,
+                &format!(
+                    "Current {:.4}   Factory {:.4}   Range {:.2}…{:.2}",
+                    r.current, r.factory, r.min, r.max
+                ),
+            ),
+            None => self
+                .ratio
+                .unavailable("No GPC→XBAR ratio relation found by the daemon"),
+        }
+        for (card, offset, what) in [
+            (&self.sys_volt, t.sys_voltage_offset.as_ref(), "SYS"),
+            (&self.video_volt, t.video_voltage_offset.as_ref(), "video"),
+        ] {
+            load_offset(card, offset, "mV", &format!("No {what} domain with a known rail"));
+        }
+        for (card, index) in [(&self.nvvdd_rail, 0u8), (&self.msvdd_rail, 1u8)] {
+            match t.voltage_rails.iter().find(|r| r.index == index) {
+                Some(r) => card.load(r),
+                None => card.unavailable("Rail objects not available on this driver"),
+            }
+        }
 
         // NVML-backed cards. On this driver the per-pstate offset is one global
         // register, so pstate 0 stands for all of them.
@@ -934,6 +1253,8 @@ impl AdvVoltagePage {
         ] {
             card.apply(config);
         }
+        self.nvvdd_rail.apply(config);
+        self.msvdd_rail.apply(config);
     }
 }
 

@@ -47,7 +47,11 @@ impl ClockCategory {
             | ClockspeedType::SysClockOffset
             | ClockspeedType::VideoClockOffset
             | ClockspeedType::MsvddOffset
-            | ClockspeedType::NvvddOffset => ClockCategory::RmDomain,
+            | ClockspeedType::NvvddOffset
+            | ClockspeedType::SysVoltageOffset
+            | ClockspeedType::VideoVoltageOffset
+            | ClockspeedType::GpcXbarRatioMilli
+            | ClockspeedType::RailLimitDelta(..) => ClockCategory::RmDomain,
             ClockspeedType::Reset => unreachable!(),
         }
     }

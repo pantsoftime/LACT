@@ -1,6 +1,8 @@
 pub mod clock_client;
 mod driver;
 pub mod nvapi;
+mod rm_prop;
+mod rm_volt;
 
 use super::{CommonControllerInfo, FanControlHandle, GpuController};
 use crate::{
@@ -19,7 +21,10 @@ use amdgpu_sysfs::{
     hw_mon::Temperature,
 };
 use anyhow::{Context, anyhow, bail, ensure};
-use clock_client::{ControlBlock, MSVDD_RAIL, RmClockDomain, RmDomainKind};
+use clock_client::{ControlBlock, RmClockDomain, RmDomainKind};
+use lact_schema::{NvidiaPropagationRatio, NvidiaRailLimitDelta, NvidiaVoltageRail, RailLimit};
+use rm_prop::PropRelation;
+use rm_volt::VoltRails;
 use driver::DriverHandle;
 use futures::{FutureExt, future::LocalBoxFuture};
 use indexmap::IndexMap;
@@ -71,6 +76,10 @@ pub struct NvidiaGpuController {
     driver_handle: Option<DriverHandle>,
     /// RM ClockClient domains, if the private interface passed its self-check
     rm_clock_domains: Option<Vec<RmClockDomain>>,
+    /// RM voltage rails + ADCs (read-only telemetry), if their layout checked out
+    rm_volt: Option<VoltRails>,
+    /// The GPC→XBAR propagation ratio relation, if found in the active topology
+    rm_prop: Option<PropRelation>,
     nvapi_therm_channel_mask: Option<i32>,
 
     last_util_timestamp: Cell<Option<u64>>,
@@ -149,6 +158,49 @@ impl NvidiaGpuController {
         if rm_clock_domains.is_some() {
             tracing::info!("RM clock domain controls (XBAR/SYS/video, MSVDD) enabled");
         }
+        let (rm_volt, rm_prop) = match (driver_handle.as_ref(), rm_clock_domains.as_deref()) {
+            (Some(handle), Some(domains)) => {
+                let volt = match VoltRails::probe(handle) {
+                    Ok(volt) => {
+                        tracing::info!(
+                            "RM voltage rail telemetry enabled ({} ADCs)",
+                            volt.adc_count()
+                        );
+                        Some(volt)
+                    }
+                    Err(err) => {
+                        warn!("RM voltage rail telemetry disabled: {err:#}");
+                        None
+                    }
+                };
+                let index_of = |kind| {
+                    domains
+                        .iter()
+                        .find(|d| d.kind == Some(kind))
+                        .map(|d| d.index)
+                };
+                let prop = match (index_of(RmDomainKind::Gpc), index_of(RmDomainKind::Xbar)) {
+                    (Some(gpc), Some(xbar)) => match PropRelation::probe(handle, gpc, xbar) {
+                        Ok(rel) => {
+                            tracing::info!(
+                                "GPC→XBAR propagation ratio control enabled (relation {} of topology {:#x}, factory {:.4})",
+                                rel.index,
+                                rel.topology_id,
+                                rm_prop::raw_to_ratio(rel.factory_raw)
+                            );
+                            Some(rel)
+                        }
+                        Err(err) => {
+                            warn!("GPC→XBAR propagation ratio control disabled: {err:#}");
+                            None
+                        }
+                    },
+                    _ => None,
+                };
+                (volt, prop)
+            }
+            _ => (None, None),
+        };
 
         Ok(Self {
             nvml,
@@ -156,6 +208,8 @@ impl NvidiaGpuController {
             common,
             driver_handle,
             rm_clock_domains,
+            rm_volt,
+            rm_prop,
             nvapi_therm_channel_mask,
             initial_target_temp: target_temp,
             last_util_timestamp: Cell::new(None),
@@ -208,18 +262,198 @@ impl NvidiaGpuController {
         })
     }
 
-    /// A voltage-rail offset on the XBAR domain, in millivolts. The driver
-    /// publishes no range for rail offsets; the bound is deliberately tight
-    /// because the only measured effect of +20 mV on MSVDD was a lower XBAR
-    /// clock, and it did not prevent the +450 MHz lockup. Rail 0 (NVVDD slot)
-    /// accepts writes but has shown no measurable effect: experimental.
-    fn rm_rail_offset(&self, block: &ControlBlock, rail: usize) -> Option<NvidiaClockOffset> {
-        let domain = self.rm_domain(RmDomainKind::Xbar)?;
+    /// A domain's voltage demand offset on its own rail (from the INFO rail
+    /// mask), in millivolts. The driver publishes no range; the bound is
+    /// deliberately tight: +20 mV on the XBAR domain lowered XBAR ~31 MHz and
+    /// moved the arbitrated MSVDD target by only 5 mV under load, because
+    /// another client is the rail winner. Not free headroom.
+    fn rm_rail_offset(&self, block: &ControlBlock, kind: RmDomainKind) -> Option<NvidiaClockOffset> {
+        let domain = self.rm_domain(kind)?;
+        let rail = domain.rail_index()?;
         Some(NvidiaClockOffset {
             current: block.rail_offset_uv(domain.index, rail) / 1000,
             min: -50,
             max: 50,
         })
+    }
+
+    fn rm_propagation_ratio(&self) -> Option<NvidiaPropagationRatio> {
+        let (handle, rel) = (self.driver_handle.as_ref()?, self.rm_prop.as_ref()?);
+        let current = rel.read_raw(handle).ok()?;
+        Some(NvidiaPropagationRatio {
+            current: rm_prop::raw_to_ratio(current),
+            factory: rm_prop::raw_to_ratio(rel.factory_raw),
+            min: rm_prop::raw_to_ratio(rm_prop::RATIO_MIN_RAW),
+            max: rm_prop::raw_to_ratio(rm_prop::RATIO_MAX_RAW),
+        })
+    }
+
+    fn rm_voltage_rails(&self) -> Vec<NvidiaVoltageRail> {
+        let (Some(handle), Some(volt)) = (self.driver_handle.as_ref(), self.rm_volt.as_ref()) else {
+            return Vec::new();
+        };
+        let status = match volt.rails_status(handle) {
+            Ok(status) => status,
+            Err(err) => {
+                warn!("could not read voltage rail status: {err:#}");
+                return Vec::new();
+            }
+        };
+        let deltas = volt.limit_deltas_uv(handle).ok();
+        let (nvvdd_sensed, msvdd_sensed) = volt.sensed_mv(handle);
+        let bound = rm_volt::LIMIT_DELTA_BOUND_UV / 1000;
+        status
+            .into_iter()
+            .map(|s| NvidiaVoltageRail {
+                index: s.index,
+                name: rm_volt::rail_name(s.index).to_owned(),
+                target_mv: s.target_uv / 1000,
+                default_mv: s.default_uv / 1000,
+                vmin_limit_mv: s.vmin_limit_uv / 1000,
+                rel_limit_mv: s.rel_limit_uv / 1000,
+                alt_rel_limit_mv: s.alt_rel_limit_uv / 1000,
+                ov_limit_mv: s.ov_limit_uv / 1000,
+                max_limit_mv: s.max_limit_uv / 1000,
+                sensed_mv: match s.index {
+                    0 => nvvdd_sensed,
+                    1 => msvdd_sensed,
+                    _ => None,
+                },
+                limit_deltas: deltas
+                    .as_ref()
+                    .map(|d| {
+                        let rail = usize::from(s.index);
+                        RailLimit::ALL
+                            .iter()
+                            .map(|limit| {
+                                let i = rm_volt::limit_index(*limit);
+                                NvidiaRailLimitDelta {
+                                    limit: *limit,
+                                    current_mv: d[rail][i] / 1000,
+                                    default_mv: volt.start_deltas_uv()[rail][i] / 1000,
+                                    min_mv: -bound,
+                                    max_mv: bound,
+                                    limit_mv: match limit {
+                                        RailLimit::Vmin => s.vmin_limit_uv,
+                                        RailLimit::Rel => s.rel_limit_uv,
+                                        RailLimit::AltRel => s.alt_rel_limit_uv,
+                                        RailLimit::Ov => s.ov_limit_uv,
+                                    } / 1000,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                device_max_mv: Some(volt.device_max_uv() / 1000),
+            })
+            .collect()
+    }
+
+    /// Apply the configured rail limit deltas; `None` = the value found at
+    /// daemon start. A raised limit is held under the voltage device's
+    /// maximum, and the driver's evaluated MAX is what actually binds.
+    fn apply_rm_rail_limits(&self, clocks: &ClocksConfiguration) -> anyhow::Result<()> {
+        let (Some(handle), Some(volt)) = (self.driver_handle.as_ref(), self.rm_volt.as_ref()) else {
+            if clocks.any_rail_limit_delta() {
+                warn!("rail limit deltas in the config were not applied: the rail objects are not available on this driver");
+            }
+            return Ok(());
+        };
+        let current = volt.limit_deltas_uv(handle)?;
+        let status = volt.rails_status(handle)?;
+        let mut wanted = *volt.start_deltas_uv();
+        for (rail, deltas) in wanted.iter_mut().enumerate() {
+            for (i, limit) in RailLimit::ALL.iter().enumerate() {
+                let Some(mv) = clocks.rail_limit_delta(rail as u8, *limit) else {
+                    continue;
+                };
+                let uv = mv * 1000;
+                if uv.abs() > rm_volt::LIMIT_DELTA_BOUND_UV {
+                    bail!("{} {} delta {mv} mV exceeds the ±{} mV bound", rm_volt::rail_name(rail as u8), limit.label(), rm_volt::LIMIT_DELTA_BOUND_UV / 1000);
+                }
+                // STATUS limits already include the current delta.
+                if let Some(s) = status.get(rail) {
+                    let evaluated = match limit {
+                        RailLimit::Vmin => s.vmin_limit_uv,
+                        RailLimit::Rel => s.rel_limit_uv,
+                        RailLimit::AltRel => s.alt_rel_limit_uv,
+                        RailLimit::Ov => s.ov_limit_uv,
+                    };
+                    let resulting = i64::from(evaluated) - i64::from(current[rail][i]) + i64::from(uv);
+                    if resulting > i64::from(volt.device_max_uv()) {
+                        bail!(
+                            "{} {} delta {mv} mV would put the limit at {} mV, above the voltage device maximum of {} mV",
+                            rm_volt::rail_name(rail as u8),
+                            limit.label(),
+                            resulting / 1000,
+                            volt.device_max_uv() / 1000
+                        );
+                    }
+                }
+                deltas[i] = uv;
+            }
+        }
+        if wanted == current {
+            return Ok(());
+        }
+        debug!("applying rail limit deltas {wanted:?} µV (was {current:?})");
+        volt.set_limit_deltas(handle, &wanted)
+            .context("Could not apply the rail limit deltas")?;
+        Ok(())
+    }
+
+    /// Voltage sensors for the stats map: sensed rails from the ADCs and the
+    /// arbitrated rail targets. Millivolts, like `voltage.gpu`.
+    fn rm_voltage_sensors(&self) -> HashMap<String, u64> {
+        let mut out = HashMap::new();
+        let (Some(handle), Some(volt)) = (self.driver_handle.as_ref(), self.rm_volt.as_ref()) else {
+            return out;
+        };
+        let (nvvdd, msvdd) = volt.sensed_mv(handle);
+        if let Some(mv) = msvdd {
+            out.insert("MSVDD".to_owned(), u64::from(mv));
+        }
+        if let Some(mv) = nvvdd {
+            out.insert("NVVDD (ADC)".to_owned(), u64::from(mv));
+        }
+        if let Ok(status) = volt.rails_status(handle) {
+            for s in status {
+                out.insert(
+                    format!("{} target", rm_volt::rail_name(s.index)),
+                    u64::from(s.target_uv / 1000),
+                );
+            }
+        }
+        out
+    }
+
+    /// Apply the configured propagation ratio; `None` means the factory
+    /// relation, like every other clock setting.
+    fn apply_rm_propagation(&self, clocks: &ClocksConfiguration) -> anyhow::Result<()> {
+        let (Some(handle), Some(rel)) = (self.driver_handle.as_ref(), self.rm_prop.as_ref()) else {
+            if clocks.gpc_xbar_ratio_milli.is_some() {
+                warn!(
+                    "GPC→XBAR propagation ratio in the config was not applied: the relation is not \
+                     available on this driver"
+                );
+            }
+            return Ok(());
+        };
+        let wanted = match clocks.gpc_xbar_ratio_milli {
+            Some(milli) => rm_prop::ratio_milli_to_raw(milli)?,
+            None => rel.factory_raw,
+        };
+        let current = rel.read_raw(handle)?;
+        if current == wanted {
+            return Ok(());
+        }
+        debug!(
+            "applying GPC→XBAR propagation ratio {:.4} (was {:.4})",
+            rm_prop::raw_to_ratio(wanted),
+            rm_prop::raw_to_ratio(current)
+        );
+        rel.set_raw(handle, wanted)
+            .context("Could not apply the GPC→XBAR propagation ratio")
     }
 
     fn rm_domain_table(&self, block: &ControlBlock) -> Vec<NvidiaRmClockDomain> {
@@ -287,19 +521,25 @@ impl NvidiaGpuController {
             }
             wanted.set_freq_offset_khz(domain.index, mhz * 1000);
         }
-        for (rail, mv, name) in [
-            (MSVDD_RAIL, clocks.msvdd_offset, "MSVDD"),
-            (0, clocks.nvvdd_offset, "NVVDD"),
+        // Each domain's voltage demand goes to the rail slot its INFO entry
+        // names; a slot the domain does not use is ignored by the driver.
+        for (kind, mv, name) in [
+            (RmDomainKind::Gpc, clocks.nvvdd_offset, "NVVDD"),
+            (RmDomainKind::Xbar, clocks.msvdd_offset, "MSVDD"),
+            (RmDomainKind::Sys, clocks.sys_voltage_offset, "SYS voltage"),
+            (RmDomainKind::Video, clocks.video_voltage_offset, "video voltage"),
         ] {
             let mv = mv.unwrap_or(0);
-            match self.rm_domain(RmDomainKind::Xbar) {
-                Some(domain) => {
+            match self.rm_domain(kind).and_then(|d| Some((d, d.rail_index()?))) {
+                Some((domain, rail)) => {
                     if mv.abs() > 50 {
                         bail!("{name} offset {mv} mV exceeds the ±50 mV bound");
                     }
                     wanted.set_rail_offset_uv(domain.index, rail, mv * 1000);
                 }
-                None if mv != 0 => bail!("{name} offset requires an adjustable XBAR domain"),
+                None if mv != 0 => {
+                    bail!("{name} offset requires an adjustable {kind} domain with a known rail")
+                }
                 None => {}
             }
         }
@@ -314,11 +554,14 @@ impl NvidiaGpuController {
         }
 
         debug!(
-            "applying RM offsets: xbar {:?} sys {:?} video {:?} msvdd {:?} mV",
+            "applying RM offsets: xbar {:?} sys {:?} video {:?} MHz; nvvdd {:?} msvdd {:?} sys {:?} video {:?} mV",
             clocks.xbar_clock_offset,
             clocks.sys_clock_offset,
             clocks.video_clock_offset,
-            clocks.msvdd_offset
+            clocks.nvvdd_offset,
+            clocks.msvdd_offset,
+            clocks.sys_voltage_offset,
+            clocks.video_voltage_offset
         );
         handle
             .clk_domains_set_control(&wanted)
@@ -1276,7 +1519,7 @@ impl GpuController for NvidiaGpuController {
             }),
             voltage: VoltageStats {
                 gpu: voltage,
-                ..Default::default()
+                sensors: self.rm_voltage_sensors(),
             },
             performance_level: None,
             active_power_states: active_pstate.map(|active_pstate| ActivePowerStates {
@@ -1379,8 +1622,18 @@ impl GpuController for NvidiaGpuController {
                 .and_then(|b| self.rm_freq_offset(b, RmDomainKind::Video)),
             msvdd_offset: rm_block
                 .as_ref()
-                .and_then(|b| self.rm_rail_offset(b, MSVDD_RAIL)),
-            nvvdd_offset: rm_block.as_ref().and_then(|b| self.rm_rail_offset(b, 0)),
+                .and_then(|b| self.rm_rail_offset(b, RmDomainKind::Xbar)),
+            nvvdd_offset: rm_block
+                .as_ref()
+                .and_then(|b| self.rm_rail_offset(b, RmDomainKind::Gpc)),
+            sys_voltage_offset: rm_block
+                .as_ref()
+                .and_then(|b| self.rm_rail_offset(b, RmDomainKind::Sys)),
+            video_voltage_offset: rm_block
+                .as_ref()
+                .and_then(|b| self.rm_rail_offset(b, RmDomainKind::Video)),
+            gpc_xbar_ratio: self.rm_propagation_ratio(),
+            voltage_rails: self.rm_voltage_rails(),
             rm_clock_domains: rm_block
                 .as_ref()
                 .map(|b| self.rm_domain_table(b))
@@ -1501,6 +1754,8 @@ impl GpuController for NvidiaGpuController {
             }
 
             self.apply_rm_offsets(clocks)?;
+            self.apply_rm_propagation(clocks)?;
+            self.apply_rm_rail_limits(clocks)?;
 
             if config.fan_control_enabled {
                 let settings = config
@@ -1632,6 +1887,22 @@ impl GpuController for NvidiaGpuController {
                 .context("Could not reset RM clock domain offsets")?
         {
             debug!("reset RM clock domain offsets to stock");
+        }
+
+        if let (Some(handle), Some(rel)) = (self.driver_handle.as_ref(), self.rm_prop.as_ref())
+            && rel.read_raw(handle)? != rel.factory_raw
+        {
+            rel.set_raw(handle, rel.factory_raw)
+                .context("Could not reset the GPC→XBAR propagation ratio")?;
+            debug!("reset GPC→XBAR propagation ratio to factory");
+        }
+
+        if let (Some(handle), Some(volt)) = (self.driver_handle.as_ref(), self.rm_volt.as_ref())
+            && volt
+                .set_limit_deltas(handle, volt.start_deltas_uv())
+                .context("Could not reset the rail limit deltas")?
+        {
+            debug!("reset rail limit deltas to the values found at start");
         }
 
         Ok(())

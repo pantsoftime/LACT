@@ -169,10 +169,17 @@ pub enum ClockspeedType {
     XbarClockOffset,
     SysClockOffset,
     VideoClockOffset,
-    /// MSVDD rail offset on the XBAR domain, millivolts
+    /// MSVDD voltage demand offset of the XBAR domain, millivolts
     MsvddOffset,
-    /// NVVDD (rail 0) offset on the XBAR domain, millivolts. Experimental.
+    /// NVVDD voltage demand offset of the GPC (core) domain, millivolts
     NvvddOffset,
+    /// Voltage demand offsets of the SYS and video domains, millivolts
+    SysVoltageOffset,
+    VideoVoltageOffset,
+    /// GPC→XBAR clock propagation ratio × 1000
+    GpcXbarRatioMilli,
+    /// Voltage-policy limit delta of a rail (0 = NVVDD, 1 = MSVDD), millivolts
+    RailLimitDelta(u8, crate::RailLimit),
 
     MaxMemoryClock,
     MinMemoryClock,

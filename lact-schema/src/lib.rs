@@ -516,15 +516,99 @@ pub struct NvidiaClocksTable {
     pub sys_offset: Option<NvidiaClockOffset>,
     #[serde(default)]
     pub video_offset: Option<NvidiaClockOffset>,
-    /// MSVDD rail offset on the XBAR domain, millivolts
+    /// MSVDD voltage demand offset of the XBAR domain, millivolts
     #[serde(default)]
     pub msvdd_offset: Option<NvidiaClockOffset>,
-    /// Rail-0 (NVVDD) offset on the XBAR domain, millivolts. Experimental.
+    /// NVVDD voltage demand offset of the GPC (core) domain, millivolts
     #[serde(default)]
     pub nvvdd_offset: Option<NvidiaClockOffset>,
+    /// Voltage demand offsets of the SYS and video domains on their rail, millivolts
+    #[serde(default)]
+    pub sys_voltage_offset: Option<NvidiaClockOffset>,
+    #[serde(default)]
+    pub video_voltage_offset: Option<NvidiaClockOffset>,
+    /// GPC→XBAR clock propagation ratio (mVolt+ "MSVDD clock ratio")
+    #[serde(default)]
+    pub gpc_xbar_ratio: Option<NvidiaPropagationRatio>,
+    /// Voltage rails: targets, policy limits and sensed voltage
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voltage_rails: Vec<NvidiaVoltageRail>,
     /// Every domain the RM ClockClient interface reports, for the live table
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rm_clock_domains: Vec<NvidiaRmClockDomain>,
+}
+
+/// The GPC→XBAR clock propagation ratio of the active clock topology.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq)]
+pub struct NvidiaPropagationRatio {
+    pub current: f64,
+    pub factory: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// One voltage rail as reported by the RM `VOLT_RAILS` objects, millivolts.
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct NvidiaVoltageRail {
+    pub index: u8,
+    pub name: String,
+    /// Arbitrated rail target (not a physical measurement)
+    pub target_mv: u32,
+    pub default_mv: u32,
+    pub vmin_limit_mv: u32,
+    pub rel_limit_mv: u32,
+    pub alt_rel_limit_mv: u32,
+    pub ov_limit_mv: u32,
+    /// Effective maximum the driver evaluates from the limits above
+    pub max_limit_mv: u32,
+    /// Mean of the on-chip ADCs attributed to this rail
+    pub sensed_mv: Option<u32>,
+    /// The four policy-limit deltas of the rail control object
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limit_deltas: Vec<NvidiaRailLimitDelta>,
+    /// Voltage-device maximum (the ceiling any raised limit is held under)
+    pub device_max_mv: Option<u32>,
+}
+
+/// Which voltage-policy limit of a rail a delta applies to.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RailLimit {
+    /// Minimum-voltage floor
+    Vmin,
+    /// Reliability limit (the usual binding maximum)
+    Rel,
+    /// Alternate reliability / operating limit ("ALT/OP", Vop)
+    AltRel,
+    /// Overvoltage ceiling
+    Ov,
+}
+
+impl RailLimit {
+    pub const ALL: [RailLimit; 4] = [RailLimit::Vmin, RailLimit::Rel, RailLimit::AltRel, RailLimit::Ov];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RailLimit::Vmin => "VMIN",
+            RailLimit::Rel => "REL",
+            RailLimit::AltRel => "ALT/OP",
+            RailLimit::Ov => "OV",
+        }
+    }
+}
+
+/// One limit delta of a rail: what is applied, what the daemon found at
+/// start (the firmware default as far as it can know), and the bound.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaRailLimitDelta {
+    pub limit: RailLimit,
+    pub current_mv: i32,
+    pub default_mv: i32,
+    pub min_mv: i32,
+    pub max_mv: i32,
+    /// The evaluated limit in STATUS (already includes `current_mv`)
+    pub limit_mv: u32,
 }
 
 /// One clock domain from NVIDIA's private RM ClockClient interface.

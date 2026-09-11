@@ -40,6 +40,10 @@ const INFO_HEADER: usize = 0x30;
 const INFO_STRIDE: usize = 0x180;
 const INFO_OFF_API_DOMAIN: usize = 0x04;
 const INFO_OFF_OFFSET_RANGE_MHZ: usize = 0x28;
+/// Which voltage rail the domain requests from: 1 = rail 0 (NVVDD) for GPC,
+/// 2 = rail 1 (MSVDD) for XBAR / SYS / video / memory on GB202. This is why a
+/// rail-0 offset on the XBAR domain never did anything.
+const INFO_OFF_RAIL_MASK: usize = 0x3c;
 
 /// First u16 of every populated domain entry, in both blocks.
 const ENTRY_TAG: u16 = 0x1010;
@@ -49,10 +53,9 @@ const OFF_FREQ_KHZ: usize = 0x0c;
 const OFF_RAIL_BASE: usize = 0x10;
 const RAIL_COUNT: usize = 4;
 
-/// The rail index that moves XBAR on the RTX 5090. SKU-dependent (reported
-/// as rail 0 on the 5060), which is why this is a constant and not a guess
-/// baked into the GUI.
-pub const MSVDD_RAIL: usize = 1;
+// The rail slot each domain's voltage demand goes to is read from GET_INFO
+// (`rail_mask`, +0x3c) rather than assumed: rail 1 for the fabric domains on
+// the RTX 5090, reportedly rail 0 on the 5060.
 
 /// Driver branches the layout above has been verified against.
 // 615 verified 2026-09-11 on GB202: GET_INFO byte-identical to 610, index->bit
@@ -110,9 +113,21 @@ pub struct RmClockDomain {
     pub offset_range_mhz: u32,
     pub controllable: bool,
     pub kind: Option<RmDomainKind>,
+    /// Voltage-rail mask from `GET_INFO` (`+0x3c`); bit n = rail slot n.
+    pub rail_mask: u32,
 }
 
 impl RmClockDomain {
+    /// The rail slot a voltage demand offset for this domain must go to.
+    pub fn rail_index(&self) -> Option<usize> {
+        if self.rail_mask.count_ones() == 1 {
+            let idx = self.rail_mask.trailing_zeros() as usize;
+            (idx < RAIL_COUNT).then_some(idx)
+        } else {
+            None
+        }
+    }
+
     pub fn name(&self) -> String {
         match self.kind {
             Some(kind) => kind.to_string(),
@@ -258,6 +273,7 @@ impl DriverHandle {
                 offset_range_mhz: rd_u32(&info.0, base + INFO_OFF_OFFSET_RANGE_MHZ),
                 controllable: controllable & (1 << index) != 0,
                 kind: RmDomainKind::from_api_domain(api_domain),
+                rail_mask: rd_u32(&info.0, base + INFO_OFF_RAIL_MASK),
             });
         }
 
@@ -279,11 +295,12 @@ impl DriverHandle {
             domains
                 .iter()
                 .map(|d| format!(
-                    "{}[{}] api={:#x} range=±{} MHz{}",
+                    "{}[{}] api={:#x} range=±{} MHz rail={:?}{}",
                     d.name(),
                     d.index,
                     d.api_domain,
                     d.offset_range_mhz,
+                    d.rail_index(),
                     if d.controllable { "" } else { " (read-only)" }
                 ))
                 .collect::<Vec<_>>()

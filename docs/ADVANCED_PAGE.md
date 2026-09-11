@@ -75,3 +75,58 @@ present but insensitive, with the reason in their tooltip.
 cargo build --release
 sudo sh install_fork.sh      # installs under /usr/local and enables lactd
 ```
+
+## Voltage rails, sensed voltages and the propagation ratio (2026-09-11)
+
+Three more private RM objects were verified read-only on R610 and R615 and
+are now used by the daemon (all fail closed on any layout mismatch):
+
+- **`VOLT_RAILS`** INFO / STATUS / CONTROL: per-rail arbitrated target and the
+  policy limits (VMIN, REL, ALT/OP, OV and the evaluated MAX). The status
+  record layout was mapped field by field from the NvAPI library's own wrapper.
+  Shown on the "NVVDD voltage limits" / "MSVDD voltage limits" cards and as
+  `NVVDD target` / `MSVDD target` voltage sensors. The rail control object's
+  REL delta is displayed (−50 mV on MSVDD is the driver default on GB202);
+  its setter is located but deliberately not wired until the remaining fields
+  are identified.
+- **`CLK_ADC_DEVICES`** INFO / STATUS: the on-chip ADCs. ADCs whose INFO
+  record carries a single GPC bit are attributed to NVVDD, the remaining one
+  to MSVDD — the attribution was confirmed by lifting the XBAR voltage demand
+  under load and watching that ADC follow the MSVDD target. Exposed as the
+  `MSVDD` and `NVVDD (ADC)` voltage sensors (graphable) and on the rail cards.
+- **`CLK_PROP_TOPS` / `CLK_CLK_PROP_TOP_RELS`**: the clock-propagation
+  topology and its relations. The daemon locates the bidirectional GPC→XBAR
+  ratio relation of the *active* topology by its properties, never by index,
+  and offers it as the "MSVDD clock ratio" card (config
+  `gpc_xbar_ratio_milli`, e.g. 950 = 0.950; `None` = factory). Writes follow
+  the same discipline as the clock-domain block: fresh read, single-field
+  change, exact readback, restore on mismatch; `reset` returns the factory
+  ratio. Accepted range 0.80–1.20. The ratio is a propagation constraint,
+  not `XBAR = GPC × ratio`.
+
+Per-domain voltage demand offsets now target each domain's own rail slot, read
+from the INFO entry's rail mask: the NVVDD offset is the GPC domain's demand
+(rail 0), and SYS / video demand cards were added next to XBAR's. A rail-0
+offset on the XBAR domain — the previous "NVVDD" control — never did anything,
+which the rail mask explains.
+
+## Rail limit deltas (2026-09-11, tranche 2)
+
+The rail control record (`VOLT_RAILS` GET_CONTROL `0x2080b213` / SET_CONTROL
+`0x2080f214`) was mapped with single-field writes and exact restores: +0x08
+REL, +0x0c ALT/OP, +0x10 OV, +0x14 VMIN, all µV deltas to the driver's
+evaluated limits; +0x18 / +0x1c move no limit and are never written. The
+"NVVDD voltage limits" / "MSVDD voltage limits" cards now edit these four
+deltas per rail (config `nvvdd_*_delta_mv`, `msvdd_*_delta_mv`; `None` =
+the values found at daemon start, which are the firmware defaults unless a
+delta was left applied across a daemon restart — the driver keeps no other
+record, so reset before restarting the daemon if you want the defaults
+re-captured). Bounds: ±250 mV per delta, and a raised limit is refused if it
+would exceed the voltage device's reported maximum (1280 mV on the reference
+card's XOC vBIOS). The driver's evaluated MAX — the tightest of REL, ALT/OP
+and OV — is what binds; raising REL alone does nothing while ALT or OV is
+tighter, exactly as mVolt+'s guide warns. −50 mV on MSVDD REL is the driver
+default on GB202, which is why the MSVDD REL limit sits 50 mV under NVVDD's.
+
+Layout note: telemetry values and card captions now request fixed widths so
+changing digits no longer re-lays out the page.
