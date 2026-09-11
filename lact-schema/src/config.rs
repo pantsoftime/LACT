@@ -124,6 +124,10 @@ pub struct ClocksConfiguration {
     pub msvdd_rel_delta_mv: Option<i32>,
     pub msvdd_alt_rel_delta_mv: Option<i32>,
     pub msvdd_ov_delta_mv: Option<i32>,
+    /// NVIDIA-only: per-rail current limits of the driver's power policies
+    /// (mVolt+ "OCP"), amps. `None` = the value found at daemon start.
+    pub nvvdd_current_limit_a: Option<i32>,
+    pub msvdd_current_limit_a: Option<i32>,
 }
 
 impl ClocksConfiguration {
@@ -160,6 +164,26 @@ impl ClocksConfiguration {
 
     pub fn any_rail_limit_delta(&self) -> bool {
         (0..2u8).any(|rail| crate::RailLimit::ALL.iter().any(|l| self.rail_limit_delta(rail, *l).is_some()))
+    }
+
+    pub fn rail_current_limit(&self, rail: u8) -> Option<i32> {
+        match rail {
+            0 => self.nvvdd_current_limit_a,
+            1 => self.msvdd_current_limit_a,
+            _ => None,
+        }
+    }
+
+    pub fn set_rail_current_limit(&mut self, rail: u8, value: Option<i32>) {
+        match rail {
+            0 => self.nvvdd_current_limit_a = value,
+            1 => self.msvdd_current_limit_a = value,
+            _ => {}
+        }
+    }
+
+    pub fn any_rail_current_limit(&self) -> bool {
+        self.nvvdd_current_limit_a.is_some() || self.msvdd_current_limit_a.is_some()
     }
 }
 
@@ -212,6 +236,7 @@ impl ClocksConfiguration {
             ClockspeedType::VideoVoltageOffset => self.video_voltage_offset = value,
             ClockspeedType::GpcXbarRatioMilli => self.gpc_xbar_ratio_milli = value,
             ClockspeedType::RailLimitDelta(rail, limit) => self.set_rail_limit_delta(rail, limit, value),
+            ClockspeedType::RailCurrentLimit(rail) => self.set_rail_current_limit(rail, value),
             ClockspeedType::Reset => {
                 *self = ClocksConfiguration::default();
             }

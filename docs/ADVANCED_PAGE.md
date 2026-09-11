@@ -173,3 +173,47 @@ Each run is a shell pipeline in its own process group (Stop ends all of it),
 writing to `<tools>/gui_tests/<name>-<timestamp>.log`, which the page tails
 once a second into the output pane. Buttons are disabled while a run is
 active and greyed out entirely if the tooling directory is not found.
+
+## Rail current limits (OCP) and rail currents (2026-09-11)
+
+The RM `PWR_POLICIES` objects (INFO `0x2080a618`, CONTROL `0x2080a61a`, SET
+`0x2080e61b`, STATUS `0x2080a619`) hold the board TGP and, on this card, one
+current-limit policy per voltage rail — what mVolt+ calls OCP. INFO entry
+word 0 is the boardobj header `{type, chIdx, limitUnit, n}` (limitUnit 0 =
+mW, 1 = mA), followed by limitMin / limitRated / limitMax; CONTROL (policy
+mask at +0x10, entries at `0x14 + i*0xc4`, type byte at +0, limit at +4)
+is what the setter takes; STATUS (mask at +4, block i at `0xa0 + i*0x1730`) carries the
+arbitrated limit at +0 and **the live channel reading at +4**.
+
+The daemon locates the two rail policies by their properties — milliamp
+unit, a finite rated limit under an unlimited maximum — and takes the larger
+rated limit as NVVDD (480 A on the reference card, 180 A on MSVDD). Before
+enabling anything it checks that the TGP entry (index from INFO header byte
++0x98) reads exactly NVML's power cap; any mismatch disables the feature.
+
+What the reference card showed (steady load at the 620 W cap): NVVDD
+307–373 A at 1.01 V, MSVDD about 72 A at 0.96 V. Lowering the NVVDD limit
+to 100 A throttled the core within a second through the PMU's GPC limit
+client (board power 150 W, NVML throttle reason "SW power cap"); the
+type-0x11 twin policy on the same channel behaves identically. Lowering the
+MSVDD limit to 50 A did the same (613 → 250 W, core 1300–1600 MHz, XBAR
+pinned at 2497 MHz by `PWR_POLICY_XBAR`), while 100 A did nothing because
+the reading was already under it. Neither limit binds at the 620 W TGP, so
+raising them buys nothing until the power limit is raised toward the XOC
+ceiling; lowering one is a way to cap that rail on its own.
+
+On the page: the "NVVDD current limit (OCP)" / "MSVDD current limit (OCP)"
+cards (config `nvvdd_current_limit_a` / `msvdd_current_limit_a`, amps;
+`None` = the value found at daemon start), accepted range 50 A … 2× the rated
+limit (NV-Voltelle's rule; the driver itself accepts 5001 A). Writes read a
+fresh preimage, change only the two limit words, require an exact readback
+and restore the preimage on mismatch; reset returns the start values. The
+"NVVDD rail" / "MSVDD rail" tiles show the policies' live readings and the
+power they imply at the rail target, published as the `NVVDD` / `MSVDD`
+current sensors (amps, graphable as "Current (…)") and the `NVVDD rail` /
+`MSVDD rail` power sensors (watts).
+
+Cost: the boost-limit sweep (two 84 KB requests, ~27 ms) and the 400 KB
+power-policy STATUS (~6 ms) are the two expensive RM reads; the daemon
+refreshes each at most every 0.9 s regardless of the GUI's stats polling
+interval, so a 250 ms poll no longer multiplies them.

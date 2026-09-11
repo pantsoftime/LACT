@@ -863,6 +863,7 @@ impl GpuController for IntelGpuController {
             cap_max: self.get_power_cap_max(),
             cap_default: self.initial_power_cap,
             sensors: HashMap::new(),
+            current_sensors: HashMap::new(),
         };
 
         let voltage = VoltageStats {

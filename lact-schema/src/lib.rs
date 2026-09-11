@@ -569,6 +569,9 @@ pub struct NvidiaVoltageRail {
     pub limit_deltas: Vec<NvidiaRailLimitDelta>,
     /// Voltage-device maximum (the ceiling any raised limit is held under)
     pub device_max_mv: Option<u32>,
+    /// The rail's power-policy current limit (mVolt+ "OCP"), amps
+    #[serde(default)]
+    pub current_limit: Option<NvidiaRailCurrentLimit>,
 }
 
 /// Which voltage-policy limit of a rail a delta applies to.
@@ -609,6 +612,21 @@ pub struct NvidiaRailLimitDelta {
     pub max_mv: i32,
     /// The evaluated limit in STATUS (already includes `current_mv`)
     pub limit_mv: u32,
+}
+
+/// The per-rail current limit of the driver's power policies ("OCP"): the
+/// applied limit, what the daemon found at start, the firmware's rated
+/// default, the accepted range and the live reading, all in amps.
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaRailCurrentLimit {
+    pub current_a: u32,
+    pub default_a: u32,
+    pub rated_a: u32,
+    pub min_a: u32,
+    pub max_a: u32,
+    /// The policy's live channel reading
+    pub measured_a: Option<u32>,
 }
 
 /// One clock domain from NVIDIA's private RM ClockClient interface.
@@ -899,6 +917,9 @@ pub struct PowerStats {
     pub cap_default: Option<f64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sensors: HashMap<String, f64>,
+    /// Rail currents in amps, where the driver reports them (NVIDIA RM power policies)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub current_sensors: HashMap<String, f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

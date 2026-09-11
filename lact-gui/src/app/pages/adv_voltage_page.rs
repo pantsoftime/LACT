@@ -926,6 +926,8 @@ pub struct AdvVoltagePage {
     tele_ratio: gtk::Label,
     tele_volt: gtk::Label,
     tele_power: gtk::Label,
+    tele_nvvdd_rail: gtk::Label,
+    tele_msvdd_rail: gtk::Label,
 
     core: Card,
     boost_lock: Card,
@@ -940,6 +942,8 @@ pub struct AdvVoltagePage {
     ratio: Card,
     mem: Card,
     power: Card,
+    nvvdd_ocp: Card,
+    msvdd_ocp: Card,
 
     nvvdd_rail: RailCard,
     msvdd_rail: RailCard,
@@ -983,11 +987,20 @@ impl relm4::Component for AdvVoltagePage {
             .build();
         content.append(&status_label);
 
-        // ---- live telemetry row
-        let tele = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        tele.set_homogeneous(true);
+        // ---- live telemetry row: a flow box, so extra tiles wrap on a
+        // narrow window instead of squeezing the row; homogeneous keeps the
+        // tiles the same width.
+        let tele = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .min_children_per_line(4)
+            .max_children_per_line(11)
+            .homogeneous(true)
+            .row_spacing(6)
+            .column_spacing(8)
+            .hexpand(true)
+            .build();
         let mut tiles = Vec::new();
-        let specs: [(&str, Vec<StatType>); 9] = [
+        let specs: [(&str, Vec<StatType>); 11] = [
             ("GPC", vec![StatType::GpuClock]),
             ("XBAR", vec![StatType::Clockspeed("XBAR".into())]),
             ("SYS", vec![StatType::Clockspeed("SYS".into())]),
@@ -1013,6 +1026,10 @@ impl relm4::Component for AdvVoltagePage {
                     StatType::PowerCap,
                 ],
             ),
+            // The power policies' own rail readings; the implied rail power
+            // ("Power (NVVDD rail)") is graphable from the graphs window.
+            ("NVVDD rail", vec![StatType::Current("NVVDD".into())]),
+            ("MSVDD rail", vec![StatType::Current("MSVDD".into())]),
         ];
         for (name, stats) in specs {
             let (tile, label) = tele_tile(name, stats, &sender);
@@ -1033,6 +1050,7 @@ impl relm4::Component for AdvVoltagePage {
             tiles.next().unwrap(),
             tiles.next().unwrap(),
         );
+        let (tele_nvvdd_rail, tele_msvdd_rail) = (tiles.next().unwrap(), tiles.next().unwrap());
         content.append(&tele);
 
         // ---- Core / NVVDD
@@ -1212,9 +1230,29 @@ impl relm4::Component for AdvVoltagePage {
             false,
             &sender,
         );
+        let nvvdd_ocp = Card::new(
+            "NVVDD current limit (OCP)",
+            "A",
+            10.0,
+            0,
+            Control::Clock(ClockspeedType::RailCurrentLimit(0)),
+            "The core rail's current limit in the driver's power policies (mVolt+ \"OCP\"), amps. Rated 480 A on the reference card, where the rail drew 307–373 A at 558–613 W: it does not bind at the 620 W TGP, so raising it buys nothing until the power limit is raised. Lowering it caps the core rail's current on its own: at 100 A the card throttled to 150 W within a second (NVML reports it as a power cap). Off = the value found at daemon start. Range 50 A … 2× rated.",
+            true,
+            &sender,
+        );
+        let msvdd_ocp = Card::new(
+            "MSVDD current limit (OCP)",
+            "A",
+            10.0,
+            0,
+            Control::Clock(ClockspeedType::RailCurrentLimit(1)),
+            "The fabric rail's current limit, amps. Rated 180 A on the reference card, where the rail drew about 72 A at the 620 W power limit, so it is nowhere near binding. Lowering it to 50 A throttled the card to 250 W within two seconds (core to 1300–1600 MHz, XBAR pinned by the policy's own client); 100 A did nothing because the reading was already under it. Off = the value found at daemon start. Range 50 A … 2× rated.",
+            true,
+            &sender,
+        );
         // mVolt+'s "extended voltage" is the same per-domain demand offsets
         // above with a ±500 mV window; the ±50 mV bound here is deliberate.
-        for f in [&mem.frame, &power.frame] {
+        for f in [&mem.frame, &power.frame, &nvvdd_ocp.frame, &msvdd_ocp.frame] {
             grid.append(f);
         }
         content.append(&grid);
@@ -1277,6 +1315,8 @@ impl relm4::Component for AdvVoltagePage {
             tele_ratio,
             tele_volt,
             tele_power,
+            tele_nvvdd_rail,
+            tele_msvdd_rail,
             core,
             boost_lock,
             vboost,
@@ -1290,6 +1330,8 @@ impl relm4::Component for AdvVoltagePage {
             ratio,
             mem,
             power,
+            nvvdd_ocp,
+            msvdd_ocp,
             nvvdd_rail,
             msvdd_rail,
             tele_msvdd,
@@ -1356,6 +1398,16 @@ impl AdvVoltagePage {
             (Some(d), None) => format!("{d:.0} W"),
             _ => "—".to_owned(),
         });
+
+        let currents = &stats.power.current_sensors;
+        let powers = &stats.power.sensors;
+        for (label, rail) in [(&self.tele_nvvdd_rail, "NVVDD"), (&self.tele_msvdd_rail, "MSVDD")] {
+            label.set_label(&match (currents.get(rail), powers.get(&format!("{rail} rail"))) {
+                (Some(a), Some(w)) => format!("{a:.0} A · {w:.0} W"),
+                (Some(a), None) => format!("{a:.0} A"),
+                _ => "—".to_owned(),
+            });
+        }
 
         self.show_perf_limits(stats);
 
@@ -1475,6 +1527,8 @@ impl AdvVoltagePage {
                 &self.video_volt,
                 &self.ratio,
                 &self.mem,
+                &self.nvvdd_ocp,
+                &self.msvdd_ocp,
             ] {
                 card.unavailable("No NVIDIA clocks table from the daemon");
             }
@@ -1509,6 +1563,32 @@ impl AdvVoltagePage {
             match t.voltage_rails.iter().find(|r| r.index == index) {
                 Some(r) => card.load(r),
                 None => card.unavailable("Rail objects not available on this driver"),
+            }
+        }
+        for (card, index) in [(&self.nvvdd_ocp, 0u8), (&self.msvdd_ocp, 1u8)] {
+            let limit = t
+                .voltage_rails
+                .iter()
+                .find(|r| r.index == index)
+                .and_then(|r| r.current_limit.as_ref());
+            match limit {
+                Some(l) => card.load(
+                    Some(f64::from(l.current_a)),
+                    f64::from(l.min_a),
+                    f64::from(l.max_a),
+                    f64::from(l.default_a),
+                    l.current_a != l.default_a,
+                    &format!(
+                        "Current {} A (rated {} A){}   Range {}…{} A",
+                        l.current_a,
+                        l.rated_a,
+                        l.measured_a
+                            .map_or(String::new(), |a| format!("   Drawing {a} A")),
+                        l.min_a,
+                        l.max_a
+                    ),
+                ),
+                None => card.unavailable("Power-policy objects not available on this driver"),
             }
         }
 
@@ -1596,6 +1676,8 @@ impl AdvVoltagePage {
             &self.video,
             &self.mem,
             &self.power,
+            &self.nvvdd_ocp,
+            &self.msvdd_ocp,
         ] {
             card.apply(config);
         }

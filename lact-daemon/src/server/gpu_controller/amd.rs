@@ -1024,6 +1024,7 @@ impl GpuController for AmdGpuController {
                 cap_min: self.hw_mon_and_then(HwMon::get_power_cap_min),
                 cap_default: self.hw_mon_and_then(HwMon::get_power_cap_default),
                 sensors: power_sensors,
+                current_sensors: HashMap::new(),
             },
             temps,
             busy_percent: self.handle.get_busy_percent().ok(),

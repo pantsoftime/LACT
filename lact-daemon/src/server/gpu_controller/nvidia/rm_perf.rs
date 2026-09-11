@@ -100,8 +100,11 @@ pub fn friendly_name(nvml: &str) -> String {
             domain(nvml)
         );
     }
+    // The PMU's own clock client is how a power policy (the TGP or a rail
+    // current limit) throttles the core: on GB202 a 100 A NVVDD limit took
+    // PMU_DOM_GRP_1 from 3375 to 885 MHz within a second.
     if nvml.starts_with("PMU_DOM_GRP_") {
-        return format!("PMU clock limit ({})", domain(nvml));
+        return format!("Power-policy clock limit ({}, PMU)", domain(nvml));
     }
     match nvml {
         "PMU_OVERRIDE" => "PMU override".to_owned(),

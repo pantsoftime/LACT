@@ -51,7 +51,8 @@ impl ClockCategory {
             | ClockspeedType::SysVoltageOffset
             | ClockspeedType::VideoVoltageOffset
             | ClockspeedType::GpcXbarRatioMilli
-            | ClockspeedType::RailLimitDelta(..) => ClockCategory::RmDomain,
+            | ClockspeedType::RailLimitDelta(..)
+            | ClockspeedType::RailCurrentLimit(_) => ClockCategory::RmDomain,
             ClockspeedType::Reset => unreachable!(),
         }
     }

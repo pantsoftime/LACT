@@ -4,6 +4,7 @@ pub mod nvapi;
 mod rm_perf;
 mod rm_perf_names;
 mod rm_prop;
+mod rm_pwr;
 mod rm_volt;
 
 use super::{CommonControllerInfo, FanControlHandle, GpuController};
@@ -25,10 +26,11 @@ use amdgpu_sysfs::{
 use anyhow::{Context, anyhow, bail, ensure};
 use clock_client::{ControlBlock, RmClockDomain, RmDomainKind};
 use lact_schema::{
-    NvidiaPropagationRatio, NvidiaRailLimitDelta, NvidiaVoltageRail, PerfLimitEntry, RailLimit,
+    NvidiaPropagationRatio, NvidiaRailCurrentLimit, NvidiaRailLimitDelta, NvidiaVoltageRail, PerfLimitEntry, RailLimit,
 };
 use rm_perf::{PerfLimitKind, PerfLimits};
 use rm_prop::PropRelation;
+use rm_pwr::PowerPolicies;
 use rm_volt::VoltRails;
 use driver::DriverHandle;
 use futures::{FutureExt, future::LocalBoxFuture};
@@ -71,6 +73,16 @@ const SUPPORTED_UTIL_TYPES: &[ProcessUtilizationType] = &[
 
 const VOLTAGE_BOOST_RANGE: RangeInclusive<i32> = 0..=100;
 
+/// The two expensive RM telemetry reads (the 0x140-client PERF_LIMITS sweep,
+/// ~27 ms, and the 400 KB power-policy STATUS, ~6 ms) are refreshed at most
+/// this often, whatever rate the GUI polls stats at.
+const RM_TELEMETRY_TTL: Duration = Duration::from_millis(900);
+
+struct Cached<T> {
+    at: Instant,
+    value: T,
+}
+
 pub struct NvidiaGpuController {
     nvml: Rc<Nvml>,
     common: CommonControllerInfo,
@@ -87,6 +99,10 @@ pub struct NvidiaGpuController {
     rm_prop: Option<PropRelation>,
     /// The arbiter's limit clients ("boost limits"), if the status parsed
     rm_perf: Option<PerfLimits>,
+    /// The PMGR power policies (TGP, per-rail current limits), if their layout checked out
+    rm_pwr: Option<PowerPolicies>,
+    perf_limits_cache: RefCell<Option<Cached<Vec<PerfLimitEntry>>>>,
+    rail_power_cache: RefCell<Option<Cached<(HashMap<String, f64>, HashMap<String, f64>)>>>,
     nvapi_therm_channel_mask: Option<i32>,
 
     last_util_timestamp: Cell<Option<u64>>,
@@ -222,6 +238,27 @@ impl NvidiaGpuController {
             _ => None,
         };
 
+        let rm_pwr = match (driver_handle.as_ref(), rm_clock_domains.as_ref()) {
+            (Some(handle), Some(_)) => {
+                let cap_mw = device.power_management_limit().ok();
+                match PowerPolicies::probe(handle, cap_mw) {
+                    Ok(pwr) => {
+                        tracing::info!(
+                            "RM power-policy rail current limits enabled (NVVDD {} A, MSVDD {} A at start)",
+                            pwr.start_limits_ma()[0] / 1000,
+                            pwr.start_limits_ma()[1] / 1000
+                        );
+                        Some(pwr)
+                    }
+                    Err(err) => {
+                        warn!("RM power-policy rail current limits disabled: {err:#}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Ok(Self {
             nvml,
             nvapi: nvapi.zip(nvapi_handle),
@@ -231,6 +268,9 @@ impl NvidiaGpuController {
             rm_volt,
             rm_prop,
             rm_perf,
+            rm_pwr,
+            perf_limits_cache: RefCell::new(None),
+            rail_power_cache: RefCell::new(None),
             nvapi_therm_channel_mask,
             initial_target_temp: target_temp,
             last_util_timestamp: Cell::new(None),
@@ -241,6 +281,21 @@ impl NvidiaGpuController {
             vf_curve_written: Cell::new(false),
             voltage_boost_written: Cell::new(false),
         })
+    }
+
+    /// A value refreshed at most every `RM_TELEMETRY_TTL`.
+    fn cached<T: Clone>(&self, slot: &RefCell<Option<Cached<T>>>, read: impl FnOnce() -> T) -> T {
+        if let Some(c) = slot.borrow().as_ref()
+            && c.at.elapsed() < RM_TELEMETRY_TTL
+        {
+            return c.value.clone();
+        }
+        let value = read();
+        *slot.borrow_mut() = Some(Cached {
+            at: Instant::now(),
+            value: value.clone(),
+        });
+        value
     }
 
     // ---- RM ClockClient (XBAR / SYS / video offsets, MSVDD rail offset) ----
@@ -366,8 +421,102 @@ impl NvidiaGpuController {
                     })
                     .unwrap_or_default(),
                 device_max_mv: Some(volt.device_max_uv() / 1000),
+                current_limit: self.rm_rail_current_limit(s.index),
             })
             .collect()
+    }
+
+    /// The rail's power-policy current limit and live reading, amps.
+    fn rm_rail_current_limit(&self, rail: u8) -> Option<NvidiaRailCurrentLimit> {
+        let (Some(handle), Some(pwr)) = (self.driver_handle.as_ref(), self.rm_pwr.as_ref()) else {
+            return None;
+        };
+        let rail = usize::from(rail);
+        if rail >= rm_pwr::RAIL_COUNT {
+            return None;
+        }
+        let limits = pwr.limits_ma(handle).ok()?;
+        let status = pwr.rail_status(handle).ok();
+        let (min, max) = pwr.accepted_range_ma(rail);
+        Some(NvidiaRailCurrentLimit {
+            current_a: limits[rail] / 1000,
+            default_a: pwr.start_limits_ma()[rail] / 1000,
+            rated_a: pwr.rated_ma(rail) / 1000,
+            min_a: min / 1000,
+            max_a: max / 1000,
+            measured_a: status.map(|s| s[rail].1 / 1000),
+        })
+    }
+
+    /// Rail currents (A) and the power they imply at the rail target (W),
+    /// for the stats maps: `(currents, powers)`. The current is the power
+    /// policy's own channel reading; the power is current × target voltage.
+    fn rm_rail_power_sensors(&self) -> (HashMap<String, f64>, HashMap<String, f64>) {
+        let mut currents = HashMap::new();
+        let mut powers = HashMap::new();
+        let (Some(handle), Some(pwr)) = (self.driver_handle.as_ref(), self.rm_pwr.as_ref()) else {
+            return (currents, powers);
+        };
+        let status = match pwr.rail_status(handle) {
+            Ok(status) => status,
+            Err(err) => {
+                warn!("could not read rail currents: {err:#}");
+                return (currents, powers);
+            }
+        };
+        let targets = self.rm_volt.as_ref().and_then(|v| v.rails_status(handle).ok());
+        for (rail, (_, ma)) in status.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let name = rm_volt::rail_name(rail as u8);
+            let amps = f64::from(*ma) / 1000.0;
+            currents.insert(name.to_owned(), amps);
+            if let Some(uv) = targets.as_ref().and_then(|t| t.get(rail)).map(|s| s.target_uv) {
+                powers.insert(format!("{name} rail"), amps * f64::from(uv) / 1_000_000.0);
+            }
+        }
+        (currents, powers)
+    }
+
+    /// Apply the configured rail current limits (mVolt+ "OCP"); `None` = the
+    /// value found at daemon start. Bounds are the policy's own minimum and
+    /// twice its rated limit.
+    fn apply_rm_rail_current_limits(&self, clocks: &ClocksConfiguration) -> anyhow::Result<()> {
+        let (Some(handle), Some(pwr)) = (self.driver_handle.as_ref(), self.rm_pwr.as_ref()) else {
+            if clocks.any_rail_current_limit() {
+                warn!("rail current limits in the config were not applied: the power-policy objects are not available on this driver");
+            }
+            return Ok(());
+        };
+        let current = pwr.limits_ma(handle)?;
+        let mut wanted = *pwr.start_limits_ma();
+        for (rail, slot) in wanted.iter_mut().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let Some(amps) = clocks.rail_current_limit(rail as u8) else {
+                continue;
+            };
+            let (lo, hi) = pwr.accepted_range_ma(rail);
+            #[allow(clippy::cast_possible_truncation)]
+            let ma = u32::try_from(amps)
+                .ok()
+                .map(|a| a.saturating_mul(1000))
+                .filter(|ma| (lo..=hi).contains(ma))
+                .with_context(|| {
+                    format!(
+                        "{} current limit {amps} A is outside the accepted {}…{} A",
+                        rm_volt::rail_name(rail as u8),
+                        lo / 1000,
+                        hi / 1000
+                    )
+                })?;
+            *slot = ma;
+        }
+        if wanted == current {
+            return Ok(());
+        }
+        tracing::info!("applying rail current limits {wanted:?} mA (was {current:?})");
+        pwr.set_limits_ma(handle, wanted)
+            .context("Could not apply the rail current limits")?;
+        Ok(())
     }
 
     /// Apply the configured rail limit deltas; `None` = the value found at
@@ -417,7 +566,7 @@ impl NvidiaGpuController {
         if wanted == current {
             return Ok(());
         }
-        debug!("applying rail limit deltas {wanted:?} µV (was {current:?})");
+        tracing::info!("applying rail limit deltas {wanted:?} µV (was {current:?})");
         volt.set_limit_deltas(handle, &wanted)
             .context("Could not apply the rail limit deltas")?;
         Ok(())
@@ -577,7 +726,7 @@ impl NvidiaGpuController {
         if current == wanted {
             return Ok(());
         }
-        debug!(
+        tracing::info!(
             "applying GPC→XBAR propagation ratio {:.4} (was {:.4})",
             rm_prop::raw_to_ratio(wanted),
             rm_prop::raw_to_ratio(current)
@@ -683,7 +832,10 @@ impl NvidiaGpuController {
             return Ok(());
         }
 
-        debug!(
+        // Info, not debug: this only fires when the block actually differs
+        // from what is configured, so it is the record of when the driver
+        // dropped the offsets (boot, and possibly resume) and they were put back.
+        tracing::info!(
             "applying RM offsets: xbar {:?} sys {:?} video {:?} MHz; nvvdd {:?} msvdd {:?} sys {:?} video {:?} mV",
             clocks.xbar_clock_offset,
             clocks.sys_clock_offset,
@@ -1576,6 +1728,8 @@ impl GpuController for NvidiaGpuController {
             .ok();
 
         let fan_range = device.min_max_fan_speed().ok();
+        let (rail_currents, rail_powers) =
+            self.cached(&self.rail_power_cache, || self.rm_rail_power_sensors());
         let power_mizer_info = device.power_mizer_mode().ok();
         let power_constraints = device.power_management_limit_constraints().ok();
 
@@ -1620,7 +1774,8 @@ impl GpuController for NvidiaGpuController {
                     .power_management_limit_default()
                     .map(|mw| f64::from(mw) / 1000.0)
                     .ok(),
-                sensors: HashMap::new(),
+                sensors: rail_powers,
+                current_sensors: rail_currents,
             },
             busy_percent: device
                 .utilization_rates()
@@ -1651,7 +1806,7 @@ impl GpuController for NvidiaGpuController {
                 gpu: voltage,
                 sensors: self.rm_voltage_sensors(),
             },
-            perf_limits: self.rm_perf_limits(),
+            perf_limits: self.cached(&self.perf_limits_cache, || self.rm_perf_limits()),
             performance_level: None,
             active_power_states: active_pstate.map(|active_pstate| ActivePowerStates {
                 core: Some(active_pstate),
@@ -1887,6 +2042,7 @@ impl GpuController for NvidiaGpuController {
             self.apply_rm_offsets(clocks)?;
             self.apply_rm_propagation(clocks)?;
             self.apply_rm_rail_limits(clocks)?;
+            self.apply_rm_rail_current_limits(clocks)?;
 
             if config.fan_control_enabled {
                 let settings = config
@@ -2034,6 +2190,14 @@ impl GpuController for NvidiaGpuController {
                 .context("Could not reset the rail limit deltas")?
         {
             debug!("reset rail limit deltas to the values found at start");
+        }
+
+        if let (Some(handle), Some(pwr)) = (self.driver_handle.as_ref(), self.rm_pwr.as_ref())
+            && pwr
+                .set_limits_ma(handle, *pwr.start_limits_ma())
+                .context("Could not reset the rail current limits")?
+        {
+            debug!("reset rail current limits to the values found at start");
         }
 
         Ok(())

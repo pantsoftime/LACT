@@ -763,6 +763,7 @@ fn clock_title(clock_type: ClockspeedType) -> String {
         ClockspeedType::RailLimitDelta(rail, limit) => {
             format!("Rail {rail} {} limit delta", limit.label())
         }
+        ClockspeedType::RailCurrentLimit(rail) => format!("Rail {rail} current limit"),
         ClockspeedType::Reset => unreachable!(),
     }
 }

@@ -180,6 +180,8 @@ pub enum ClockspeedType {
     GpcXbarRatioMilli,
     /// Voltage-policy limit delta of a rail (0 = NVVDD, 1 = MSVDD), millivolts
     RailLimitDelta(u8, crate::RailLimit),
+    /// Power-policy current limit of a rail (0 = NVVDD, 1 = MSVDD), amps
+    RailCurrentLimit(u8),
 
     MaxMemoryClock,
     MinMemoryClock,
