@@ -679,6 +679,8 @@ pub struct AdvVoltagePage {
     nvvdd_rail: RailCard,
     msvdd_rail: RailCard,
     tele_msvdd: gtk::Label,
+    limits_summary: gtk::Label,
+    limits_list: gtk::Label,
     guard_switch: gtk::Switch,
     table: Option<NvidiaClocksTable>,
 }
@@ -953,6 +955,34 @@ impl relm4::Component for AdvVoltagePage {
         }
         content.append(&grid);
 
+        // ---- Boost limits: the arbiter's populated limit clients
+        content.append(&section_label("Boost limits"));
+        let limits_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        limits_box.set_margin_all(8);
+        let limits_summary = gtk::Label::builder()
+            .label("—")
+            .xalign(0.0)
+            .wrap(true)
+            .build();
+        let limits_list = gtk::Label::builder()
+            .label("—")
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["caption", "dim-label", "monospace"])
+            .build();
+        limits_box.append(&limits_summary);
+        limits_box.append(&limits_list);
+        let limits_frame = gtk::Frame::builder()
+            .child(&limits_box)
+            .tooltip_text(
+                "Every populated limit client of the driver's clock arbiter (RM PERF_LIMITS status), \
+                 read live. Voltage limits are named from the rail policy; the core is bounded by the \
+                 tightest maximum among the clients that produce a core clock. Floors (controller \
+                 minimums) are listed but never reported as the bound.",
+            )
+            .build();
+        content.append(&limits_frame);
+
         // ---- Validation / guard rails
         content.append(&section_label("Validation"));
         let guard_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -1022,6 +1052,8 @@ impl relm4::Component for AdvVoltagePage {
             nvvdd_rail,
             msvdd_rail,
             tele_msvdd,
+            limits_summary,
+            limits_list,
             guard_switch,
             table: None,
         };
@@ -1085,6 +1117,8 @@ impl AdvVoltagePage {
             _ => "—".to_owned(),
         });
 
+        self.show_perf_limits(stats);
+
         // The power cap card is fed by stats, not by the clocks table.
         match (p.cap_current, p.cap_min, p.cap_max) {
             (Some(cur), Some(min), Some(max)) => {
@@ -1107,6 +1141,49 @@ impl AdvVoltagePage {
                 .power
                 .unavailable("Power limit not reported by the driver"),
         }
+    }
+
+    fn show_perf_limits(&self, stats: &Arc<DeviceStats>) {
+        let limits = &stats.perf_limits;
+        if limits.is_empty() {
+            self.limits_summary
+                .set_label("Boost-limit telemetry not available on this driver");
+            self.limits_list.set_label("—");
+            return;
+        }
+        // The core is bounded by the tightest maximum among clients that yield
+        // a core clock. Floors are excluded; everything else is a candidate.
+        let bound = limits
+            .iter()
+            .filter(|l| !l.is_minimum && l.domain.as_deref() == Some("GPCCLK"))
+            .filter_map(|l| l.result_mhz.map(|mhz| (mhz, l)))
+            .min_by_key(|(mhz, _)| *mhz);
+        self.limits_summary.set_label(&match bound {
+            Some((mhz, l)) => format!(
+                "Core bounded by {}{} at {mhz} MHz   ·   {} populated clients",
+                l.name,
+                l.limit_mv.map_or(String::new(), |mv| format!(" ({mv} mV)")),
+                limits.len()
+            ),
+            None => format!("{} populated clients, none yields a core clock", limits.len()),
+        });
+        let mut rows: Vec<String> = limits
+            .iter()
+            .map(|l| {
+                format!(
+                    "{:<26} {:>9} {:>9}{}",
+                    l.name,
+                    l.limit_mhz
+                        .map(|m| format!("{m} MHz"))
+                        .or_else(|| l.limit_mv.map(|v| format!("{v} mV")))
+                        .unwrap_or_default(),
+                    l.result_mhz.map_or(String::new(), |m| format!("→ {m}")),
+                    if l.is_minimum { "  (floor)" } else { "" }
+                )
+            })
+            .collect();
+        rows.sort();
+        self.limits_list.set_label(&rows.join("\n"));
     }
 
     fn show_table(&self, table: Option<&NvidiaClocksTable>) {

@@ -130,3 +130,20 @@ default on GB202, which is why the MSVDD REL limit sits 50 mV under NVVDD's.
 
 Layout note: telemetry values and card captions now request fixed widths so
 changing digits no longer re-lays out the page.
+
+## Boost limits (2026-09-11)
+
+`PERF_LIMITS_GET_STATUS_V2` (`0x2080a079`) lists the clock arbiter's limit
+clients. The daemon reads all 256 IDs (two requests of 128; 256 at once is
+rejected) and publishes the populated ones as `perf_limits` in the stats.
+Record layout, decoded on GB202 / R615: +0x4 type (2 = frequency, 6 =
+voltage-policy), +0xc frequency kHz, +0x10 `apiDomain` mask, +0x20 limit
+code (bit 8 = MSVDD), +0x34 voltage µV, +0x13c valid, +0x144 resulting kHz.
+Voltage limits are named by matching their voltage to the rail policy limits
+(so "NVVDD REL limit 1055 mV → 3217 MHz" is data, not a table); frequency
+limits are named by domain and ID; the PERF-CF controller minimums (0xd0–0xd2,
+per Loong0x00) are flagged as floors. The page's "Boost limits" panel shows
+the tightest core maximum among the non-floor clients as the reason the core
+sits where it does, and lists the rest. Which client the driver actually
+selects is not flagged by this object; the power-policy client was not
+observed in testing (a 300 W cap did not engage within the test window).

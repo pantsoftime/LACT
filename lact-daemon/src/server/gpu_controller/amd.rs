@@ -1060,6 +1060,7 @@ impl GpuController for AmdGpuController {
                 .then_some(active_power_states)
             },
             throttle_info,
+            perf_limits: Vec::new(),
         }
     }
 

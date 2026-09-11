@@ -69,6 +69,12 @@ const API_DOMAIN_XBAR: u32 = 0x0000_0002;
 const API_DOMAIN_SYS: u32 = 0x0000_0004;
 const API_DOMAIN_MEMORY: u32 = 0x0000_0010;
 const API_DOMAIN_VIDEO: u32 = 0x0010_0000;
+/// Display and hub: named from the public NV2080 clock-domain bitmask
+/// (DISPCLK 0x40, HUBCLK 0x8), consistent with the measured 1188 MHz and
+/// 540 MHz, but not identified by an underclock probe (their offset range is
+/// 0, so they are read-only anyway).
+const API_DOMAIN_DISP: u32 = 0x0000_0040;
+const API_DOMAIN_HUB: u32 = 0x0000_0008;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RmDomainKind {
@@ -77,16 +83,20 @@ pub enum RmDomainKind {
     Sys,
     Video,
     Memory,
+    Disp,
+    Hub,
 }
 
 impl RmDomainKind {
-    fn from_api_domain(api_domain: u32) -> Option<Self> {
+    pub fn from_api_domain(api_domain: u32) -> Option<Self> {
         match api_domain {
             API_DOMAIN_GPC => Some(Self::Gpc),
             API_DOMAIN_XBAR => Some(Self::Xbar),
             API_DOMAIN_SYS => Some(Self::Sys),
             API_DOMAIN_MEMORY => Some(Self::Memory),
             API_DOMAIN_VIDEO => Some(Self::Video),
+            API_DOMAIN_DISP => Some(Self::Disp),
+            API_DOMAIN_HUB => Some(Self::Hub),
             _ => None,
         }
     }
@@ -100,6 +110,8 @@ impl fmt::Display for RmDomainKind {
             Self::Sys => "SYSCLK",
             Self::Video => "VIDCLK",
             Self::Memory => "DRAMCLK",
+            Self::Disp => "DISPCLK",
+            Self::Hub => "HUBCLK",
         })
     }
 }

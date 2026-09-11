@@ -1,6 +1,7 @@
 pub mod clock_client;
 mod driver;
 pub mod nvapi;
+mod rm_perf;
 mod rm_prop;
 mod rm_volt;
 
@@ -22,7 +23,10 @@ use amdgpu_sysfs::{
 };
 use anyhow::{Context, anyhow, bail, ensure};
 use clock_client::{ControlBlock, RmClockDomain, RmDomainKind};
-use lact_schema::{NvidiaPropagationRatio, NvidiaRailLimitDelta, NvidiaVoltageRail, RailLimit};
+use lact_schema::{
+    NvidiaPropagationRatio, NvidiaRailLimitDelta, NvidiaVoltageRail, PerfLimitEntry, RailLimit,
+};
+use rm_perf::{PerfLimitKind, PerfLimits};
 use rm_prop::PropRelation;
 use rm_volt::VoltRails;
 use driver::DriverHandle;
@@ -80,6 +84,8 @@ pub struct NvidiaGpuController {
     rm_volt: Option<VoltRails>,
     /// The GPC→XBAR propagation ratio relation, if found in the active topology
     rm_prop: Option<PropRelation>,
+    /// The arbiter's limit clients ("boost limits"), if the status parsed
+    rm_perf: Option<PerfLimits>,
     nvapi_therm_channel_mask: Option<i32>,
 
     last_util_timestamp: Cell<Option<u64>>,
@@ -201,6 +207,19 @@ impl NvidiaGpuController {
             }
             _ => (None, None),
         };
+        let rm_perf = match (driver_handle.as_ref(), rm_clock_domains.as_ref()) {
+            (Some(handle), Some(_)) => match PerfLimits::probe(handle) {
+                Ok(perf) => {
+                    tracing::info!("RM performance-limit (boost limit) telemetry enabled");
+                    Some(perf)
+                }
+                Err(err) => {
+                    warn!("RM performance-limit telemetry disabled: {err:#}");
+                    None
+                }
+            },
+            _ => None,
+        };
 
         Ok(Self {
             nvml,
@@ -210,6 +229,7 @@ impl NvidiaGpuController {
             rm_clock_domains,
             rm_volt,
             rm_prop,
+            rm_perf,
             nvapi_therm_channel_mask,
             initial_target_temp: target_temp,
             last_util_timestamp: Cell::new(None),
@@ -400,6 +420,100 @@ impl NvidiaGpuController {
         volt.set_limit_deltas(handle, &wanted)
             .context("Could not apply the rail limit deltas")?;
         Ok(())
+    }
+
+    /// The populated limit clients, named from data where possible: a
+    /// voltage limit is matched against the rail's policy limits (VMIN / REL /
+    /// ALT/OP / OV), a frequency limit is named by its domain. IDs known to be
+    /// floors (the PERF-CF controller minimums, per Loong0x00's A/B on R610)
+    /// are flagged so the GUI does not report them as what bounds the boost.
+    fn rm_perf_limits(&self) -> Vec<PerfLimitEntry> {
+        let (Some(handle), Some(perf)) = (self.driver_handle.as_ref(), self.rm_perf.as_ref()) else {
+            return Vec::new();
+        };
+        let limits = match perf.read(handle) {
+            Ok(limits) => limits,
+            Err(err) => {
+                warn!("could not read performance limits: {err:#}");
+                return Vec::new();
+            }
+        };
+        let rails = self
+            .rm_volt
+            .as_ref()
+            .and_then(|v| v.rails_status(handle).ok())
+            .unwrap_or_default();
+        let domain_name = |mask: u32| -> Option<String> {
+            RmDomainKind::from_api_domain(mask)
+                .map(|k| k.to_string())
+                .or_else(|| {
+                    self.rm_clock_domains
+                        .as_deref()?
+                        .iter()
+                        .find(|d| d.api_domain == mask)
+                        .map(RmClockDomain::name)
+                })
+        };
+        const CONTROLLER_MINIMUMS: [u32; 3] = [0xd0, 0xd1, 0xd2];
+        limits
+            .into_iter()
+            .map(|l| {
+                let (name, domain, limit_mhz, limit_mv) = match l.kind {
+                    PerfLimitKind::Frequency { khz, domain_mask } => {
+                        let domain = domain_name(domain_mask);
+                        let what = if CONTROLLER_MINIMUMS.contains(&l.id) {
+                            "controller minimum"
+                        } else {
+                            "frequency limit"
+                        };
+                        (
+                            format!("{} {what} {:#04x}", domain.as_deref().unwrap_or("clock"), l.id),
+                            domain,
+                            Some(khz / 1000),
+                            None,
+                        )
+                    }
+                    PerfLimitKind::Voltage { uv, rail } => {
+                        let rail_name = rm_volt::rail_name(rail);
+                        let which = rails.iter().find(|r| r.index == rail).and_then(|r| {
+                            [
+                                (r.vmin_limit_uv, "VMIN"),
+                                (r.rel_limit_uv, "REL"),
+                                (r.alt_rel_limit_uv, "ALT/OP"),
+                                (r.ov_limit_uv, "OV"),
+                            ]
+                            .into_iter()
+                            .find(|(v, _)| *v == uv)
+                            .map(|(_, n)| n)
+                        });
+                        (
+                            match which {
+                                Some(which) => format!("{rail_name} {which} limit"),
+                                None => format!("{rail_name} voltage limit {:#04x}", l.id),
+                            },
+                            l.result_khz.map(|_| RmDomainKind::Gpc.to_string()),
+                            None,
+                            Some(uv / 1000),
+                        )
+                    }
+                    PerfLimitKind::Other { type_code, value } => (
+                        format!("limit {:#04x} (type {type_code}, value {value})", l.id),
+                        None,
+                        None,
+                        None,
+                    ),
+                };
+                PerfLimitEntry {
+                    id: l.id,
+                    name,
+                    domain,
+                    limit_mhz,
+                    limit_mv,
+                    result_mhz: l.result_khz.map(|k| k / 1000),
+                    is_minimum: CONTROLLER_MINIMUMS.contains(&l.id),
+                }
+            })
+            .collect()
     }
 
     /// Voltage sensors for the stats map: sensed rails from the ADCs and the
@@ -1521,6 +1635,7 @@ impl GpuController for NvidiaGpuController {
                 gpu: voltage,
                 sensors: self.rm_voltage_sensors(),
             },
+            perf_limits: self.rm_perf_limits(),
             performance_level: None,
             active_power_states: active_pstate.map(|active_pstate| ActivePowerStates {
                 core: Some(active_pstate),

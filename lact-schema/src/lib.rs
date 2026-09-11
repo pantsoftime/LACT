@@ -746,6 +746,30 @@ pub struct DeviceStats {
     pub supported_power_mizer_modes: Option<Vec<PowerMizerMode>>,
     pub active_power_states: Option<ActivePowerStates>,
     pub throttle_info: Option<BTreeMap<String, Vec<String>>>,
+    /// The clock arbiter's populated limit clients ("boost limits"), where
+    /// the driver exposes them. NVIDIA RM only, for now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perf_limits: Vec<PerfLimitEntry>,
+}
+
+/// One populated performance-limit client of the clock arbiter.
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PerfLimitEntry {
+    pub id: u32,
+    /// Human name where it could be derived from data (voltage limits from
+    /// the rail policy, frequency limits from their domain); otherwise the
+    /// raw ID.
+    pub name: String,
+    pub domain: Option<String>,
+    /// The client's own value, where it is a frequency
+    pub limit_mhz: Option<u32>,
+    /// The client's own value, where it is a voltage
+    pub limit_mv: Option<u32>,
+    /// The clock the driver derives from this client, if any
+    pub result_mhz: Option<u32>,
+    /// True for clients known to be floors (they never bound the boost)
+    pub is_minimum: bool,
 }
 
 #[skip_serializing_none]
