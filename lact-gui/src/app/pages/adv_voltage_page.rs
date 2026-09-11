@@ -1151,21 +1151,52 @@ impl AdvVoltagePage {
             self.limits_list.set_label("—");
             return;
         }
-        // The core is bounded by the tightest maximum among clients that yield
-        // a core clock. Floors are excluded; everything else is a candidate.
+        // The power cap, thermal and power-brake slowdowns are not limit
+        // clients in this object (verified: a 400 W cap took the core from
+        // 3067 to 2752 MHz and no client changed), so NVML's throttle reasons
+        // take precedence as the reason when one is active.
+        let throttled: Vec<&str> = stats
+            .throttle_info
+            .as_ref()
+            .map(|info| {
+                info.keys()
+                    .filter(|k| !k.contains("GPU_IDLE"))
+                    .map(|k| match k.as_str() {
+                        "SW_POWER_CAP" => "the power cap",
+                        "HW_SLOWDOWN" => "a hardware slowdown",
+                        "SW_THERMAL_SLOWDOWN" => "thermal slowdown",
+                        "HW_THERMAL_SLOWDOWN" => "hardware thermal slowdown",
+                        "HW_POWER_BRAKE_SLOWDOWN" => "power brake",
+                        "SYNC_BOOST" => "sync boost",
+                        "APPLICATIONS_CLOCKS_SETTING" => "the applications clock setting",
+                        "DISPLAY_CLOCK_SETTING" => "the display clock setting",
+                        other => other,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Otherwise the core is bounded by the tightest maximum among clients
+        // that yield a core clock. Floors are excluded.
         let bound = limits
             .iter()
             .filter(|l| !l.is_minimum && l.domain.as_deref() == Some("GPCCLK"))
             .filter_map(|l| l.result_mhz.map(|mhz| (mhz, l)))
             .min_by_key(|(mhz, _)| *mhz);
-        self.limits_summary.set_label(&match bound {
-            Some((mhz, l)) => format!(
+        let gpc = stats.clockspeed.gpu_clockspeed;
+        self.limits_summary.set_label(&match (throttled.is_empty(), bound) {
+            (false, _) => format!(
+                "Core held by {} (driver throttle reason){}   ·   {} populated limit clients",
+                throttled.join(", "),
+                gpc.map_or(String::new(), |c| format!(" at {c} MHz")),
+                limits.len()
+            ),
+            (true, Some((mhz, l))) => format!(
                 "Core bounded by {}{} at {mhz} MHz   ·   {} populated clients",
                 l.name,
                 l.limit_mv.map_or(String::new(), |mv| format!(" ({mv} mV)")),
                 limits.len()
             ),
-            None => format!("{} populated clients, none yields a core clock", limits.len()),
+            (true, None) => format!("{} populated clients, none yields a core clock", limits.len()),
         });
         let mut rows: Vec<String> = limits
             .iter()

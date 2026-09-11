@@ -463,6 +463,8 @@ impl NvidiaGpuController {
                         let domain = domain_name(domain_mask);
                         let what = if CONTROLLER_MINIMUMS.contains(&l.id) {
                             "controller minimum"
+                        } else if rm_perf::POWER_POLICY_IDS.contains(&l.id) {
+                            "power policy limit"
                         } else {
                             "frequency limit"
                         };

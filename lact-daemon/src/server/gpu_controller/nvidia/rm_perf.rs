@@ -18,7 +18,12 @@
 //! | +0x13c  | valid byte |
 //! | +0x144  | resulting clock, kHz, or 0xffffffff |
 //!
-//! Requesting all 256 IDs in one call is rejected; 128 per call is accepted.
+//! Requesting all IDs in one call is rejected; 128 per call is accepted. The
+//! table extends past 0xff: on GB202 / R615 the clients 0x10f–0x114 are
+//! populated, and 0x110 (GPC) / 0x111 (XBAR) are the **power-policy
+//! limits** — they tracked a 400 W cap (3202 → 1642, 2880 → 2512 MHz) while
+//! nothing below 0xff moved. IDs up to 0x13f are read; every ID up to 4095 is
+//! accepted by the driver but none above 0x114 was populated.
 //! Read-only. Which client *binds* is not flagged by the driver; the caller
 //! reports the tightest maximum it can identify and lists the rest.
 
@@ -32,7 +37,10 @@ const SIZE: usize = 0x14804;
 const BASE: usize = 0x4;
 const STRIDE: usize = 0x148;
 const BATCH: usize = 128;
-const ID_COUNT: usize = 256;
+const ID_COUNT: usize = 0x140;
+
+/// Clients identified by manipulation on GB202 (see the module docs).
+pub const POWER_POLICY_IDS: [u32; 2] = [0x110, 0x111];
 
 const OFF_TYPE: usize = 0x04;
 const OFF_VALUE: usize = 0x0c;
