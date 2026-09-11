@@ -61,7 +61,9 @@ Blackwell card: the NVML-backed controls the Overclocking page also has
 (core and memory offset, power limit, voltage boost, locked core clock) plus
 the ones only this page reaches.
 
-![Advanced page: telemetry tiles, the core and fabric cards and the two rail-limit cards](./res/screenshots/advanced-1.png)
+| Telemetry, clock and voltage cards, rail limits | Memory and power, boost limits, tests |
+| --- | --- |
+| ![Advanced page: telemetry tiles, the core and fabric cards and the two rail-limit cards](./res/screenshots/advanced-1.png) | ![Advanced page: memory and power cards, the boost-limit panel and the test runner](./res/screenshots/advanced-2.png) |
 
 ## What the page controls
 
