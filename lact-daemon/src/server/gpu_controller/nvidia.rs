@@ -2,6 +2,7 @@ pub mod clock_client;
 mod driver;
 pub mod nvapi;
 mod rm_perf;
+mod rm_perf_names;
 mod rm_prop;
 mod rm_volt;
 
@@ -458,6 +459,7 @@ impl NvidiaGpuController {
         limits
             .into_iter()
             .map(|l| {
+                let nvml = rm_perf::nvml_name(l.id);
                 let (name, domain, limit_mhz, limit_mv) = match l.kind {
                     PerfLimitKind::Frequency { khz, domain_mask } => {
                         let domain = domain_name(domain_mask);
@@ -505,14 +507,26 @@ impl NvidiaGpuController {
                         None,
                     ),
                 };
+                // NVIDIA's own name wins where NVML knows the ID; the
+                // empirical naming above covers the Blackwell clients it
+                // does not (0x110/0x111 power cap controller, 0x113/0x114).
+                let name = match nvml {
+                    Some(n) => rm_perf::friendly_name(n),
+                    None if rm_perf::POWER_POLICY_IDS.contains(&l.id) => {
+                        format!("Power cap controller ({})", domain.as_deref().unwrap_or("?"))
+                    }
+                    None => name,
+                };
                 PerfLimitEntry {
                     id: l.id,
+                    nvml_name: nvml.map(str::to_owned),
                     name,
                     domain,
                     limit_mhz,
                     limit_mv,
                     result_mhz: l.result_khz.map(|k| k / 1000),
-                    is_minimum: CONTROLLER_MINIMUMS.contains(&l.id),
+                    is_minimum: CONTROLLER_MINIMUMS.contains(&l.id)
+                        || nvml.is_some_and(|n| n.ends_with("_MIN")),
                 }
             })
             .collect()

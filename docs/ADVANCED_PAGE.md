@@ -147,3 +147,29 @@ the tightest core maximum among the non-floor clients as the reason the core
 sits where it does, and lists the rest. Which client the driver actually
 selects is not flagged by this object; the power-policy client was not
 observed in testing (a 300 W cap did not engage within the test window).
+
+## Tests section and the XBAR guard (2026-09-11)
+
+The XBAR card no longer has a validated-maximum switch: the slider spans the
+driver's range (±1000 MHz) and the hover note carries what the harness found
+on the reference card (+250 daily, +300 clean, +340 and +380 silent
+corruption with no crash or Xid, +450 hard lock). The guard is the
+correctness check itself.
+
+A "Tests" section runs the tooling repo's scripts from the page. The tooling
+directory is `$LACT_ADV_TOOLS_DIR`, defaulting to
+`~/claude_workspace/linux_mvolt`, and the torch venv comes from the tooling's
+own `linuxvolt.json`. Buttons:
+
+- **Correctness check** — harness run at the applied setting, compared bit
+  for bit with `stock_a.json` (about 2.5 minutes). The verdict (MATCH or
+  SILENT CORRUPTION) is shown in the status line.
+- **Rebuild baseline** — two stock runs plus the probe reference; refuses
+  unless every RM offset is 0 and 4 GiB of VRAM is free.
+- **Steady load (2 min)** — the duty-cycled load the clock probes use.
+- **Driver check** — the read-only half of the post-driver-update checklist.
+
+Each run is a shell pipeline in its own process group (Stop ends all of it),
+writing to `<tools>/gui_tests/<name>-<timestamp>.log`, which the page tails
+once a second into the output pane. Buttons are disabled while a run is
+active and greyed out entirely if the tooling directory is not found.

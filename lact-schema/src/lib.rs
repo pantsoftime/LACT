@@ -757,9 +757,10 @@ pub struct DeviceStats {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PerfLimitEntry {
     pub id: u32,
-    /// Human name where it could be derived from data (voltage limits from
-    /// the rail policy, frequency limits from their domain); otherwise the
-    /// raw ID.
+    /// NVIDIA's own name for the client (from NVML's table), if known
+    pub nvml_name: Option<String>,
+    /// Readable name: NVIDIA's name rendered, or derived from data for the
+    /// clients NVML does not know
     pub name: String,
     pub domain: Option<String>,
     /// The client's own value, where it is a frequency

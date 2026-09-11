@@ -31,6 +31,105 @@ use anyhow::{Context, bail};
 use tracing::debug;
 
 use super::driver::DriverHandle;
+use super::rm_perf_names::NVML_PERF_LIMIT_NAMES;
+
+/// NVIDIA's own name for a limit client (without the `PERF_LIMIT_` prefix),
+/// from the table inside `libnvidia-ml.so`. `None` for IDs NVML does not know
+/// (the Blackwell clients above 0x10f).
+pub fn nvml_name(id: u32) -> Option<&'static str> {
+    NVML_PERF_LIMIT_NAMES
+        .binary_search_by_key(&id, |(i, _)| *i)
+        .ok()
+        .map(|i| NVML_PERF_LIMIT_NAMES[i].1)
+}
+
+/// Readable rendering of an NVML limit name. "LOGIC" is the NVVDD rail and
+/// "SRAM" the MSVDD rail in NVIDIA's terms; DOM_GRP_1 is the GPC clock group,
+/// DOM_GRP_0 the P-state group; CLIENT_STRICT_* are the locked-clock requests.
+pub fn friendly_name(nvml: &str) -> String {
+    let rail = |s: &str| {
+        if s.contains("LOGIC") {
+            "NVVDD"
+        } else if s.contains("SRAM") {
+            "MSVDD"
+        } else {
+            "?"
+        }
+    };
+    let domain = |s: &str| -> String {
+        let last = s.rsplit('_').next().unwrap_or("");
+        let body = s.trim_end_matches("_MIN").trim_end_matches("_MAX");
+        let d = body.rsplit('_').next().unwrap_or("");
+        match d {
+            "1" if body.contains("DOM_GRP") => "GPC".to_owned(),
+            "0" if body.contains("DOM_GRP") => "P-state".to_owned(),
+            "GPC" | "XBAR" | "DRAM" | "NVD" | "DISP" | "SYS" => d.to_owned(),
+            _ => last.to_owned(),
+        }
+    };
+    let floor = nvml.ends_with("_MIN");
+    if let Some(rest) = nvml.strip_prefix("RELIABILITY_ALT_") {
+        return format!("Operating voltage limit ({}, ALT/OP)", rail(rest));
+    }
+    if let Some(rest) = nvml.strip_prefix("RELIABILITY_") {
+        return format!("Reliability voltage limit ({})", rail(rest));
+    }
+    if let Some(rest) = nvml.strip_prefix("OVERVOLTAGE_") {
+        return format!("Overvoltage ceiling ({})", rail(rest));
+    }
+    if let Some(rest) = nvml.strip_prefix("VMIN_") {
+        return format!("Minimum voltage ({})", rail(rest));
+    }
+    if nvml.starts_with("PERF_CF_CONTROLLER_") {
+        return format!(
+            "Boost controller {} ({})",
+            if floor { "floor" } else { "ceiling" },
+            domain(nvml)
+        );
+    }
+    if nvml.starts_with("THERM_POLICY_") {
+        return format!("Thermal policy ({})", domain(nvml));
+    }
+    if nvml.starts_with("PWR_POLICY_") {
+        return format!("Power policy ({})", domain(nvml));
+    }
+    if nvml.starts_with("CLIENT_STRICT_") || nvml.starts_with("CLIENT_LOW_STRICT_") {
+        return format!(
+            "Locked clock {} ({})",
+            if floor { "minimum" } else { "maximum" },
+            domain(nvml)
+        );
+    }
+    if nvml.starts_with("PMU_DOM_GRP_") {
+        return format!("PMU clock limit ({})", domain(nvml));
+    }
+    match nvml {
+        "PMU_OVERRIDE" => "PMU override".to_owned(),
+        "CUDA_MAX" => "CUDA context maximum".to_owned(),
+        "ISMODEPOSSIBLE" => "Display mode requirement (P-state)".to_owned(),
+        "ISMODEPOSSIBLE_DISP" => "Display mode requirement (display clock)".to_owned(),
+        "PERFMON" => "Performance monitor".to_owned(),
+        _ => {
+            let words: Vec<String> = nvml
+                .split('_')
+                .map(|w| match w {
+                    "LOGIC" => "NVVDD".to_owned(),
+                    "SRAM" => "MSVDD".to_owned(),
+                    "MIN" => "minimum".to_owned(),
+                    "MAX" => "maximum".to_owned(),
+                    w => {
+                        let mut c = w.chars();
+                        match c.next() {
+                            Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                            None => String::new(),
+                        }
+                    }
+                })
+                .collect();
+            words.join(" ")
+        }
+    }
+}
 
 const PERF_LIMITS_GET_STATUS_V2: u32 = 0x2080_a079;
 const SIZE: usize = 0x14804;

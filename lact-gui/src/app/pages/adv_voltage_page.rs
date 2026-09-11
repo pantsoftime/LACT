@@ -27,12 +27,17 @@ use lact_schema::{
 };
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt};
 use std::cell::{Cell, RefCell};
+use std::fs;
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-/// Highest XBAR offset the correctness harness has passed on the reference
-/// card. Going above it needs the explicit switch on the page.
-const VALIDATED_MAX_XBAR_MHZ: f64 = 300.0;
+/// Where the tooling repo (harness, loads, probes) lives; overridable.
+const TOOLS_DIR_ENV: &str = "LACT_ADV_TOOLS_DIR";
+const TOOLS_DIR_DEFAULT: &str = "claude_workspace/linux_mvolt";
 /// Requested width of card text; every card asks for the same width so the
 /// grid stays aligned, and it is what sets how many cards fit a row.
 const CARD_TEXT_CHARS: i32 = 26;
@@ -470,6 +475,258 @@ impl RailCard {
     }
 }
 
+/// Runs the tooling repo's scripts from the page: the correctness harness,
+/// the baseline rebuild, a steady load and the post-driver-update check.
+/// Each run is a shell pipeline in its own process group (so Stop ends all
+/// of it), writing to a log file under `<tools>/gui_tests/` that the page
+/// tails once a second. The verdict is read out of the log when it ends.
+struct TestRunner {
+    tools_dir: PathBuf,
+    venv: String,
+    status: gtk::Label,
+    buffer: gtk::TextBuffer,
+    buttons: Rc<RefCell<Vec<gtk::Button>>>,
+    stop: gtk::Button,
+    child: Rc<RefCell<Option<(Child, String, Instant, PathBuf)>>>,
+}
+
+impl TestRunner {
+    fn tools_dir() -> PathBuf {
+        std::env::var_os(TOOLS_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                    .join(TOOLS_DIR_DEFAULT)
+            })
+    }
+
+    /// The torch venv the harness needs, from the tooling's own config.
+    fn venv(tools_dir: &std::path::Path) -> String {
+        fs::read_to_string(tools_dir.join("linuxvolt.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("venv_python")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "python3".to_owned())
+    }
+
+    fn new() -> (Self, gtk::Frame) {
+        let tools_dir = Self::tools_dir();
+        let venv = Self::venv(&tools_dir);
+        let available = tools_dir.join("xbar_verify.py").is_file();
+
+        let status = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .label(&if available {
+                format!("Idle   ·   tooling {}   ·   venv {venv}", tools_dir.display())
+            } else {
+                format!(
+                    "Tooling not found at {} (set {TOOLS_DIR_ENV})",
+                    tools_dir.display()
+                )
+            })
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let buffer = gtk::TextBuffer::new(None);
+        let view = gtk::TextView::builder()
+            .buffer(&buffer)
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .left_margin(6)
+            .right_margin(6)
+            .build();
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&view)
+            .min_content_height(150)
+            .max_content_height(260)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .build();
+        let stop = gtk::Button::builder()
+            .label("Stop")
+            .sensitive(false)
+            .css_classes(["destructive-action"])
+            .tooltip_text("Ends the running test (its whole process group).")
+            .build();
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        body.set_margin_all(8);
+        body.append(&row);
+        body.append(&status);
+        body.append(&scroller);
+        let frame = gtk::Frame::builder().child(&body).build();
+
+        let runner = Self {
+            tools_dir,
+            venv,
+            status,
+            buffer,
+            buttons: Rc::new(RefCell::new(Vec::new())),
+            stop: stop.clone(),
+            child: Rc::new(RefCell::new(None)),
+        };
+        let v = format!("'{}'", runner.venv);
+        let tests: [(&str, &str, String); 4] = [
+            (
+                "Correctness check",
+                "Runs the harness at the setting that is applied right now and compares it bit for bit \
+                 with the stock baseline (stock_a.json). ~2.5 min at ~400 W. MATCH or SILENT CORRUPTION.",
+                format!("{v} xbar_verify.py run --out gui_check.json && {v} xbar_verify.py compare stock_a.json gui_check.json"),
+            ),
+            (
+                "Rebuild baseline",
+                "Two stock runs plus the probe reference (~6 min). Refuses unless every RM offset is 0 \
+                 and 4 GiB of VRAM is free — turn XBAR off and apply first.",
+                format!("VENV_PYTHON={v} sh rebuild_baseline.sh"),
+            ),
+            (
+                "Steady load (2 min)",
+                "Duty-cycled matmul + memory sweep that keeps the card in P0 below the power cap; \
+                 what the clock probes and the ratio A/B were measured under.",
+                format!("{v} steady_load.py --seconds 120"),
+            ),
+            (
+                "Driver check",
+                "The read-only half of the post-driver-update checklist: snapshot the RM surface, \
+                 diff it against the previous driver, measure, correlate.",
+                "sh after_driver_update.sh".to_owned(),
+            ),
+        ];
+        for (label, tip, cmd) in tests {
+            let button = gtk::Button::builder()
+                .label(label)
+                .tooltip_text(tip)
+                .sensitive(available)
+                .build();
+            let (name, cmd, r) = (label.to_owned(), cmd.clone(), runner.handles());
+            button.connect_clicked(move |_| r.start(&name, &cmd));
+            row.append(&button);
+            runner.buttons.borrow_mut().push(button);
+        }
+        row.append(&stop);
+        {
+            let child = runner.child.clone();
+            stop.connect_clicked(move |_| {
+                if let Some((c, ..)) = child.borrow().as_ref() {
+                    // The child is its own process-group leader; kill the group.
+                    let _ = Command::new("kill")
+                        .args(["-TERM", "--", &format!("-{}", c.id())])
+                        .status();
+                }
+            });
+        }
+        (runner, frame)
+    }
+
+    /// Clones of what a click handler needs.
+    fn handles(&self) -> Self {
+        Self {
+            tools_dir: self.tools_dir.clone(),
+            venv: self.venv.clone(),
+            status: self.status.clone(),
+            buffer: self.buffer.clone(),
+            buttons: self.buttons.clone(),
+            stop: self.stop.clone(),
+            child: self.child.clone(),
+        }
+    }
+
+    fn start(&self, name: &str, cmd: &str) {
+        if self.child.borrow().is_some() {
+            return;
+        }
+        let log_dir = self.tools_dir.join("gui_tests");
+        let started = Instant::now();
+        let log = log_dir.join(format!(
+            "{}-{}.log",
+            name.to_lowercase().replace(' ', "_"),
+            gtk::glib::DateTime::now_local()
+                .ok()
+                .and_then(|t| t.format("%Y%m%d-%H%M%S").ok())
+                .map_or_else(|| "now".to_owned(), |t| t.to_string())
+        ));
+        let spawned = fs::create_dir_all(&log_dir)
+            .and_then(|()| fs::File::create(&log))
+            .and_then(|file| {
+                let err = file.try_clone()?;
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .current_dir(&self.tools_dir)
+                    .stdout(Stdio::from(file))
+                    .stderr(Stdio::from(err))
+                    .process_group(0)
+                    .spawn()
+            });
+        let child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                self.status.set_label(&format!("Could not start {name}: {err}"));
+                return;
+            }
+        };
+        self.buffer.set_text(&format!("$ {cmd}\n"));
+        self.status.set_label(&format!("Running {name}…"));
+        for b in self.buttons.borrow().iter() {
+            b.set_sensitive(false);
+        }
+        self.stop.set_sensitive(true);
+        *self.child.borrow_mut() = Some((child, name.to_owned(), started, log));
+
+        let r = self.handles();
+        gtk::glib::timeout_add_local(Duration::from_secs(1), move || r.poll());
+    }
+
+    fn poll(&self) -> gtk::glib::ControlFlow {
+        let mut slot = self.child.borrow_mut();
+        let Some((child, name, started, log)) = slot.as_mut() else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        let text = fs::read_to_string(&*log).unwrap_or_default();
+        let tail: Vec<&str> = text.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
+        self.buffer.set_text(&tail.join("\n"));
+        let elapsed = started.elapsed().as_secs();
+        match child.try_wait() {
+            Ok(None) => {
+                self.status.set_label(&format!("Running {name}… {elapsed} s"));
+                gtk::glib::ControlFlow::Continue
+            }
+            Ok(Some(code)) => {
+                let verdict = if text.contains("SILENT CORRUPTION") {
+                    "SILENT CORRUPTION — the applied setting computes wrong results"
+                } else if text.contains("MATCH") {
+                    "MATCH — bit-identical to the stock baseline"
+                } else if code.success() {
+                    "finished"
+                } else {
+                    "failed"
+                };
+                self.status.set_label(&format!(
+                    "{name}: {verdict}   ({elapsed} s, exit {}, log {})",
+                    code.code().unwrap_or(-1),
+                    log.display()
+                ));
+                self.finish(&mut slot)
+            }
+            Err(err) => {
+                self.status.set_label(&format!("{name}: could not wait: {err}"));
+                self.finish(&mut slot)
+            }
+        }
+    }
+
+    fn finish(&self, slot: &mut Option<(Child, String, Instant, PathBuf)>) -> gtk::glib::ControlFlow {
+        *slot = None;
+        for b in self.buttons.borrow().iter() {
+            b.set_sensitive(true);
+        }
+        self.stop.set_sensitive(false);
+        gtk::glib::ControlFlow::Break
+    }
+}
+
 // ------------------------------------------------------------ widget helpers
 
 fn heading(text: &str) -> gtk::Label {
@@ -681,7 +938,6 @@ pub struct AdvVoltagePage {
     tele_msvdd: gtk::Label,
     limits_summary: gtk::Label,
     limits_list: gtk::Label,
-    guard_switch: gtk::Switch,
     table: Option<NvidiaClocksTable>,
 }
 
@@ -828,8 +1084,8 @@ impl relm4::Component for AdvVoltagePage {
             10.0,
             0,
             Control::Clock(ClockspeedType::XbarClockOffset),
-            "Verified by readback and CLK_MEASURE_FREQ. Harness-validated to +300; above that needs the guard switch below.",
-            false,
+            "Driver range ±1000 MHz, no guard. On the reference card the harness passed +250 (daily) and +300, found silent corruption at +340 and +380 with no crash and no Xid, and +450 hard-locked the machine. The correctness check below is the guard.",
+            true,
             &sender,
         );
         let msvdd = Card::new(
@@ -970,60 +1226,37 @@ impl relm4::Component for AdvVoltagePage {
             .wrap(true)
             .css_classes(["caption", "dim-label", "monospace"])
             .build();
-        limits_box.append(&limits_summary);
+        let limits_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        limits_summary.set_hexpand(true);
+        limits_header.append(&limits_summary);
+        limits_header.append(&info_icon(
+            "Every populated limit client of the driver's clock arbiter (RM PERF_LIMITS status), read \
+             live, named with NVIDIA's own names from NVML's table (shown in brackets).\n\n\
+             The two numbers on a row are the client's own value and what the driver makes of it:\n\
+             • Frequency clients ask for a clock, so the first number is MHz and the arrow normally \
+             echoes it (\"3375 MHz → 3375\").\n\
+             • Voltage-policy clients ask for a voltage (mV); the arrow is the core clock the V/F \
+             curve reaches at that voltage (\"1055 mV → 3217\" = at the reliability voltage the core \
+             tops out at 3217 MHz). That is how a voltage limit becomes a clock ceiling.\n\
+             • MSVDD voltage rows have no arrow: this object only reports a core result, and those \
+             limits act on the fabric rail. P-state style clients carry no frequency at all.\n\
+             • Rows marked (floor) are minimums — the lowest clock the boost controller allows, not a \
+             cap — and are excluded from the summary. Low floors mean the card is idle.\n\n\
+             The summary line is the smallest core result among the non-floor clients: a ceiling, so \
+             it is meaningful at idle too. While NVML reports an active throttle reason (power cap, \
+             thermal…), that reason is shown instead, because the power-cap controller rows are \
+             sampled controller output that swings well below the average clock.",
+            false,
+        ));
+        limits_box.append(&limits_header);
         limits_box.append(&limits_list);
-        let limits_frame = gtk::Frame::builder()
-            .child(&limits_box)
-            .tooltip_text(
-                "Every populated limit client of the driver's clock arbiter (RM PERF_LIMITS status), \
-                 read live. Voltage limits are named from the rail policy; the core is bounded by the \
-                 tightest maximum among the clients that produce a core clock. Floors (controller \
-                 minimums) are listed but never reported as the bound.",
-            )
-            .build();
+        let limits_frame = gtk::Frame::builder().child(&limits_box).build();
         content.append(&limits_frame);
 
-        // ---- Validation / guard rails
-        content.append(&section_label("Validation"));
-        let guard_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        guard_box.set_margin_all(10);
-        let guard_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
-        guard_box.append(&guard_switch);
-        guard_box.append(
-            &gtk::Label::builder()
-                .label(&format!(
-                    "Allow XBAR above the validated +{VALIDATED_MAX_XBAR_MHZ:.0} MHz"
-                ))
-                .xalign(0.0)
-                .hexpand(true)
-                .build(),
-        );
-        guard_box.append(&info_icon(
-            "+380 MHz produced wrong compute results with no crash and no Xid; +450 MHz hard-locked the machine. \
-             Anything above the validated maximum needs the correctness harness before daily use.",
-            true,
-        ));
-        guard_box.append(
-            &gtk::Button::builder()
-                .label("Run correctness check")
-                .sensitive(false)
-                .tooltip_text("Launches xbar_verify.py against the applied setting. Not wired into the GUI yet — run it from a terminal.")
-                .build(),
-        );
-        content.append(&gtk::Frame::builder().child(&guard_box).build());
-        {
-            let adjustment = xbar.adjustment.clone();
-            guard_switch.connect_active_notify(move |switch| {
-                if switch.is_active() {
-                    adjustment.set_upper(1000.0);
-                } else {
-                    adjustment.set_upper(VALIDATED_MAX_XBAR_MHZ);
-                    if adjustment.value() > VALIDATED_MAX_XBAR_MHZ {
-                        adjustment.set_value(VALIDATED_MAX_XBAR_MHZ);
-                    }
-                }
-            });
-        }
+        // ---- Tests: the tooling repo's scripts, run from here
+        content.append(&section_label("Tests"));
+        let (_test_runner, tests_frame) = TestRunner::new();
+        content.append(&tests_frame);
 
         let model = Self {
             content,
@@ -1054,7 +1287,6 @@ impl relm4::Component for AdvVoltagePage {
             tele_msvdd,
             limits_summary,
             limits_list,
-            guard_switch,
             table: None,
         };
 
@@ -1202,14 +1434,17 @@ impl AdvVoltagePage {
             .iter()
             .map(|l| {
                 format!(
-                    "{:<26} {:>9} {:>9}{}",
+                    "{:<44} {:>9} {:>9}{}   {}",
                     l.name,
                     l.limit_mhz
                         .map(|m| format!("{m} MHz"))
                         .or_else(|| l.limit_mv.map(|v| format!("{v} mV")))
                         .unwrap_or_default(),
                     l.result_mhz.map_or(String::new(), |m| format!("→ {m}")),
-                    if l.is_minimum { "  (floor)" } else { "" }
+                    if l.is_minimum { "  (floor)" } else { "" },
+                    l.nvml_name
+                        .as_deref()
+                        .map_or_else(|| format!("id {:#04x}", l.id), |n| format!("[{n}]"))
                 )
             })
             .collect();
@@ -1326,11 +1561,6 @@ impl AdvVoltagePage {
         load_offset(&self.video, t.video_offset.as_ref(), "MHz", rm);
         load_offset(&self.msvdd, t.msvdd_offset.as_ref(), "mV", rm);
         load_offset(&self.nvvdd, t.nvvdd_offset.as_ref(), "mV", rm);
-
-        // Keep the XBAR guard in force after the table refreshes the bounds.
-        if !self.guard_switch.is_active() && self.xbar.adjustment.upper() > VALIDATED_MAX_XBAR_MHZ {
-            self.xbar.adjustment.set_upper(VALIDATED_MAX_XBAR_MHZ);
-        }
 
         if t.xbar_offset.is_some() {
             self.status_label.set_visible(false);
