@@ -8,6 +8,15 @@
 This application allows you to control your AMD, Nvidia or Intel GPU on a Linux
 system.
 
+> **This fork** adds an **Advanced** page for NVIDIA GPUs: the fabric (XBAR)
+> clock, per-domain voltage demand, the voltage-rail policy limits, the
+> GPC→XBAR propagation ratio, live rail and ADC voltages, and the driver's
+> boost-limit clients — the controls the Windows tuning tools reach through
+> private NvAPI, done on Linux through the driver's own RM interface. It is
+> developed and verified on an RTX 5090 (GB202) with driver branches R610 and
+> R615. Everything else is upstream LACT. [Jump to the fork section.](#the-advanced-page-this-fork)
+
+
 | GPU info                          | Overclocking                      | Fan control                       |
 | ----------------------------------| ----------------------------------| ----------------------------------|
 | ![image](./res/screenshots/1.png) | ![image](./res/screenshots/2.png) | ![image](./res/screenshots/3.png) |
@@ -43,6 +52,98 @@ system.
 GPU configuration is handled by a system service that does not depend on a graphical session (Wayland/X11).
 
 The service can also be used standalone with a config file, for example in headless scenarios.
+
+
+# The Advanced page (this fork)
+
+One page, laid out after mVolt+, for everything that tunes an NVIDIA
+Blackwell card: the NVML-backed controls the Overclocking page also has
+(core and memory offset, power limit, voltage boost, locked core clock) plus
+the ones only this page reaches.
+
+![Advanced page: telemetry tiles, the core and fabric cards and the two rail-limit cards](./res/screenshots/advanced-1.png)
+
+## What the page controls
+
+| Card | What it does | Mechanism |
+| --- | --- | --- |
+| XBAR / SYS / video clock offset | Frequency offset of the crossbar, system and video clock domains, the ones NVML does not expose. Driver range ±1000 MHz. | RM `CLK_DOMAINS` control block, readback-verified |
+| Core / XBAR / SYS / video voltage offset | Each domain's *voltage demand* on its own rail (NVVDD for the core, MSVDD for the fabric domains). The arbiter grants the highest demand on the rail, so these nudge rather than set. ±50 mV. | Same control block, rail slot from the driver's own rail mask |
+| NVVDD / MSVDD voltage limits | The four policy limits of each rail as deltas: VMIN, REL (reliability, normally the binding maximum), ALT/OP (operating), OV (overvoltage ceiling). ±250 mV, held under the voltage device's maximum. | RM `VOLT_RAILS` control object |
+| MSVDD clock ratio | The GPC→XBAR clock-propagation ratio of the active clock topology (factory 0.9 on GB202). A ceiling, not a formula. 0.80–1.20. | RM `CLK_PROP_TOP_RELS` |
+| Telemetry tiles | Measured GPC, XBAR, SYS, video and memory clocks, XBAR/GPC ratio, core and MSVDD voltage, power. Click a tile to graph it. | RM `CLK_MEASURE_FREQ`, rail status, on-chip ADCs |
+| Boost limits | Every populated limit client of the driver's clock arbiter with NVIDIA's own name, its value and the clock it produces, and which one bounds the core. | RM `PERF_LIMITS` status, names from NVML's table |
+| Tests | Runs the companion tooling from the page: a correctness harness at the applied setting, a baseline rebuild, a steady load, a post-driver-update check. | Subprocesses, log tailed into the pane |
+
+## How it works
+
+The controls go through NVIDIA's private RM control objects over
+`/dev/nvidiactl`, the same path the daemon already uses for other queries,
+with command IDs and parameter sizes recovered from the size table inside
+`libnvidia-api.so` and record layouts established on the card. Nothing here
+is in a public header, so the daemon treats every object defensively:
+
+- **Per-branch gate.** The clock-domain interface is only enabled on driver
+  branches its layout has been verified against (R610 and R615). On any
+  other branch the page shows why, and offsets left in the config are
+  skipped with a warning rather than blocking the rest of the profile.
+- **Self-checks before use.** Every object is probed at daemon start: entry
+  tags, object types, rail counts, record indices. Anything unexpected
+  disables that one feature.
+- **Domains by identity, not index.** Clock domains are resolved by their
+  `apiDomain` selector and the propagation relation by its properties,
+  because the index→domain map is not an identity on this hardware.
+- **Every write is read back.** A successful status alone is never trusted;
+  the ratio setter restores the previous object on a mismatch, and reset
+  returns every object to what the daemon found at start.
+- **Nothing here detects wrong answers.** An XBAR offset can read back
+  correctly, never crash, and still corrupt computation (+340 MHz on the
+  reference card did exactly that). The correctness check in the Tests
+  section is the guard, and the card notes carry what it found.
+
+Offsets live in LACT's normal config, are applied at daemon start, and are
+covered by the confirm-or-revert timer like any other setting.
+
+## What the measurements said (RTX 5090, torch workloads)
+
+- XBAR +250 is bit-exact under a crossbar-heavy harness and is the daily
+  setting; +300 passed; **+340 and +380 silently corrupt** with no crash and
+  no Xid; +450 hard-locks the machine.
+- Neither the MSVDD demand offset (+20 mV) nor the MSVDD REL limit (+30 mV,
+  which really did raise the loaded rail target from 995 to 1030 mV) rescued
+  +340. On this card the fabric clock's correctness ceiling is not a voltage
+  margin at ~1 V.
+- The propagation ratio is a ceiling: 0.80 pulled XBAR down ~180 MHz
+  immediately and reversibly; raising it did nothing while the offset and
+  V/F curve were the binding constraint.
+- Under a power cap the core is held by the driver's power-policy controller
+  (clients 0x110/0x111), which the page reports through NVML's throttle
+  reason; otherwise the reliability voltage limit (1055 mV → 3217 MHz) is
+  what bounds the core.
+
+Details, layouts and the full record are in
+[docs/ADVANCED_PAGE.md](docs/ADVANCED_PAGE.md).
+
+## Building and installing this fork
+
+Same as upstream (see *Building from source* below), then
+`sudo sh install_fork.sh` installs under `/usr/local` and enables `lactd`.
+The Tests section expects the companion tooling directory (harness, loads,
+probes) at `~/claude_workspace/linux_mvolt` or `$LACT_ADV_TOOLS_DIR`; without
+it the buttons are greyed out and everything else works.
+
+## Credits and caveats
+
+The XBAR clock control was discovered by
+[Loong0x00](https://github.com/Loong0x00) (LACT issue #1147, whose LACT
+branch also established the propagation-ratio layout);
+[SHANAjam](https://github.com/SHANAjam/rtx5090-xbar-control) published the
+NvAPI side; [b00nz's mVolt+](https://github.com/b00nz/mVolt) set the
+interface model and vocabulary; upstream PR #1158 by Panchovix implements
+the domain offsets independently. Everything on this page writes
+undocumented GPU state; it can crash, hard-lock or silently miscompute, and
+it is only as verified as the notes say. Use it with a correctness check,
+not a benchmark.
 
 # Quick links
 
