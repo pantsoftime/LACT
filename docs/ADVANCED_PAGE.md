@@ -115,7 +115,10 @@ which the rail mask explains.
 The rail control record (`VOLT_RAILS` GET_CONTROL `0x2080b213` / SET_CONTROL
 `0x2080f214`) was mapped with single-field writes and exact restores: +0x08
 REL, +0x0c ALT/OP, +0x10 OV, +0x14 VMIN, all µV deltas to the driver's
-evaluated limits; +0x18 / +0x1c move no limit and are never written. The
+evaluated limits; +0x18 / +0x1c move no limit and are never written.
+The record's first word on rail 0 is NvAPI's voltage-boost percent (what
+the Voltage boost card writes, 0–100), so the probe checks only the type
+byte; it once refused the whole feature after the boost was set to 100 %. The
 "NVVDD voltage limits" / "MSVDD voltage limits" cards now edit these four
 deltas per rail (config `nvvdd_*_delta_mv`, `msvdd_*_delta_mv`; `None` =
 the values found at daemon start, which are the firmware defaults unless a

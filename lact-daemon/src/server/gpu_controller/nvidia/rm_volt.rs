@@ -58,11 +58,14 @@ const ST_NOISE_UNAWARE_VMIN_UV: usize = 0x24;
 const ST_SENSED_UV: usize = 0x28;
 const ST_TARGET_UV: usize = 0x60;
 
-// CONTROL record fields. +0x08 holds -50000 on the MSVDD rail at stock, which
-// is the "-50 mV REL default" mVolt+ documents and matches the 50 mV gap
-// between the two rails' REL limits; the remaining words are zero at stock
-// and their meaning is not yet established.
-const CT_INDEX: usize = 0x00;
+// CONTROL record fields. +0x00 on rail 0 is NvAPI's voltage-boost
+// "percent delta" (0–100; LACT's Voltage boost control writes it, and it
+// read 100 after the user set that card to 100 %) — it is not a rail index,
+// which an earlier version of this probe assumed from reading 0 / 1 at
+// stock. +0x08 holds -50000 on the MSVDD rail at stock, which is the "-50 mV
+// REL default" mVolt+ documents and matches the 50 mV gap between the two
+// rails' REL limits.
+const CT_BOOST_PERCENT: usize = 0x00;
 const CT_TYPE: usize = 0x04;
 const CT_REL_DELTA_UV: usize = 0x08;
 const CT_ALT_REL_DELTA_UV: usize = 0x0c;
@@ -248,8 +251,15 @@ impl VoltRails {
             .context("VOLT_RAILS_GET_CONTROL")?;
         for rail in 0..RAIL_COUNT {
             let base = RAILS_CONTROL_HEADER + rail * RAILS_CONTROL_STRIDE;
-            if rd_u32(&control, base + CT_INDEX) != rail as u32 || control[base + CT_TYPE] != RAIL_TYPE {
-                bail!("VOLT_RAILS CONTROL rail {rail} layout check failed");
+            if control[base + CT_TYPE] != RAIL_TYPE {
+                bail!(
+                    "VOLT_RAILS CONTROL rail {rail} has type {:#x}, expected {RAIL_TYPE:#x}",
+                    control[base + CT_TYPE]
+                );
+            }
+            let boost = rd_u32(&control, base + CT_BOOST_PERCENT);
+            if rail == 0 && boost > 100 {
+                bail!("VOLT_RAILS CONTROL rail 0 boost percent {boost} is implausible");
             }
         }
 
