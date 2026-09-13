@@ -757,12 +757,9 @@ impl relm4::Component for WireViewPage {
             last_error: None,
         };
         model.update_buttons();
-        // Hidden in the sidebar until a device is found; the first poll runs
-        // once the page is parented.
-        {
-            let root = root.clone();
-            glib::idle_add_local_once(move || set_page_visible(&root, false));
-        }
+        // The sidebar entry is hidden as soon as the first poll says there is
+        // no device (not before: a saved "selected tab" of this page must
+        // still be honoured when the device is present).
         sender.input(WireViewPageMsg::Tick);
 
         let widgets = view_output!();
@@ -778,10 +775,15 @@ impl relm4::Component for WireViewPage {
                     Ok(Some(info)) => {
                         let first = !self.detected;
                         self.detected = true;
+                        // The by-id path carries the USB serial; show the
+                        // plain tty on the page and keep the full path in the tooltip.
+                        let tty = std::fs::canonicalize(&info.port)
+                            .map_or_else(|_| info.port.clone(), |p| p.display().to_string());
                         self.info_label.set_label(&format!(
-                            "{}   ·   firmware v{} ({})   ·   {}",
-                            info.product, info.firmware, info.build, info.port
+                            "{}   ·   firmware v{} ({})   ·   {tty}",
+                            info.product, info.firmware, info.build
                         ));
+                        self.info_label.set_tooltip_text(Some(&info.port));
                         self.info = Some(info);
                         set_page_visible(&self.root, true);
                         if first {
@@ -1020,9 +1022,6 @@ impl WireViewPage {
         }
         let mapped = self.root.is_mapped();
         if !self.detected {
-            // Keep the sidebar entry hidden until a device answers (the page
-            // may not have been parented yet when init tried).
-            set_page_visible(&self.root, false);
             if self.ticks % DETECT_EVERY == 1 {
                 self.request_info(sender);
             }
@@ -1054,7 +1053,6 @@ impl WireViewPage {
     }
 
     fn disconnected(&mut self, text: &str) {
-        let was = self.detected;
         self.detected = false;
         self.info = None;
         self.loaded = None;
@@ -1062,9 +1060,7 @@ impl WireViewPage {
         self.tabs.set_sensitive(false);
         self.clear_live();
         self.update_buttons();
-        if was {
-            set_page_visible(&self.root, false);
-        }
+        set_page_visible(&self.root, false);
     }
 
     fn status(&self, text: &str, error: bool) {

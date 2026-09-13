@@ -128,6 +128,45 @@ covered by the confirm-or-revert timer like any other setting.
 Details, layouts and the full record are in
 [docs/ADVANCED_PAGE.md](docs/ADVANCED_PAGE.md).
 
+# The WireView II page (this fork)
+
+If a Thermal Grizzly **WireView Pro II** is plugged in (the inline power
+meter on the GPU's 12V-2x6 cable, which shows up as an STM32 virtual COM
+port), a **WireView II** entry appears in the sidebar. It is a port of the
+[wv2ctl / wv2gui](https://github.com/pantsoftime/wv2ctl) tooling into LACT,
+so one application covers the card and the cable meter.
+
+![WireView II page: live power, current and per-pin bars scaled to the device's limits, faults, and the Protection tab with the fault-action matrix](./res/screenshots/wireview.png)
+
+- **Live panel** — board power and total current as bars scaled to the
+  device's over-power and over-current limits, six per-pin current bars
+  scaled to the per-wire limit (amber from 80 %, red from 95 %), the four
+  temperature probes, fan duty, average rail voltage, the PSU capability
+  the cable reports, and the active and logged faults with a Clear button.
+- **Settings** — every configuration field of the device in five tabs:
+  Protection (limits and the fault × action matrix for display, buzzer,
+  Soft Off and Hard Off), Fan (mode, source, curve), Display (screens,
+  timeouts, bar scales, rotation), Theme (background, colours) and Device
+  (name, averaging window, logging interval). Edited fields turn amber and
+  the change count shows next to the buttons.
+- **Writing** — *Apply live* writes to the device without saving (lost on
+  power loss); *Save to flash* writes, stores to flash and reads the flash
+  copy back. Both list the exact changes first. Before every write the
+  daemon backs the previous configuration up under
+  `/var/lib/lact/wireview/`, and a write is refused if the device's
+  configuration changed since the page loaded it. *Backup…* / *Restore…*
+  use the same JSON as wv2ctl, so either tool can read the other's files.
+- **Sharing the port** — the daemon opens the serial port only while the
+  page is on screen and releases it about five seconds after you switch
+  away, so the command-line tool still works; while the page is visible
+  the CLI reports the device as busy.
+
+The daemon also implements compare-with-flash, revert-from-flash, factory
+reset and screen switching (`wireview_flash`, `wireview_nvm`,
+`wireview_screen` over the socket); they are not on the page yet. Only
+config struct version 2 (firmware v5) is handled, and the page fails closed
+on anything else. Details in [docs/ADVANCED_PAGE.md](./docs/ADVANCED_PAGE.md).
+
 ## Building and installing this fork
 
 Same as upstream (see *Building from source* below), then
