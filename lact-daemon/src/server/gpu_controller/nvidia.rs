@@ -445,6 +445,7 @@ impl NvidiaGpuController {
             min_a: min / 1000,
             max_a: max / 1000,
             measured_a: status.map(|s| s[rail].1 / 1000),
+            arbitrated_a: status.map(|s| s[rail].0 / 1000),
         })
     }
 

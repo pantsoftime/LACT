@@ -627,6 +627,10 @@ pub struct NvidiaRailCurrentLimit {
     pub max_a: u32,
     /// The policy's live channel reading
     pub measured_a: Option<u32>,
+    /// The limit the driver actually arbitrates to (mVolt+ "runtime limit");
+    /// below `current_a` when another input is tighter
+    #[serde(default)]
+    pub arbitrated_a: Option<u32>,
 }
 
 /// One clock domain from NVIDIA's private RM ClockClient interface.

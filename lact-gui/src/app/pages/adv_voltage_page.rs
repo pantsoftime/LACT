@@ -1579,9 +1579,12 @@ impl AdvVoltagePage {
                     f64::from(l.default_a),
                     l.current_a != l.default_a,
                     &format!(
-                        "Current {} A (rated {} A){}   Range {}…{} A",
+                        "Current {} A (rated {} A){}{}   Range {}…{} A",
                         l.current_a,
                         l.rated_a,
+                        l.arbitrated_a
+                            .filter(|a| *a != l.current_a)
+                            .map_or(String::new(), |a| format!(", driver holds {a} A")),
                         l.measured_a
                             .map_or(String::new(), |a| format!("   Drawing {a} A")),
                         l.min_a,
