@@ -127,6 +127,25 @@ pub enum Request<'a> {
     EnableOverdrive,
     DisableOverdrive,
     GenerateSnapshot,
+    /// Thermal Grizzly WireView Pro II (this fork): `None` when no device is plugged in
+    WireViewInfo,
+    WireViewStatus,
+    WireViewSetConfig {
+        config: Box<crate::WireViewConfig>,
+        /// Hex of the config the edit was based on; refused if the device's differs
+        expected_raw: Option<String>,
+        /// Apply without saving to flash
+        #[serde(default)]
+        live: bool,
+    },
+    WireViewNvm {
+        op: crate::WireViewNvmOp,
+    },
+    WireViewFlash,
+    WireViewClearFaults,
+    WireViewScreen {
+        screen: String,
+    },
     ConfirmPendingConfig(ConfirmCommand),
     RestConfig,
 }

@@ -14,7 +14,8 @@ use connection::{DaemonConnection, tcp::TcpConnection, unix::UnixConnection};
 use nix::unistd::getuid;
 use schema::{
     ClocksInfo, DeviceInfo, DeviceListEntry, DeviceStats, PowerStates, ProfilesInfo, Request,
-    Response, SystemInfo,
+    Response, SystemInfo, WireViewConfig, WireViewFlashInfo, WireViewInfo, WireViewNvmOp,
+    WireViewStatus, WireViewWriteResult,
     request::{ConfirmCommand, ProfileBase, SetClocksCommand},
 };
 use serde::de::DeserializeOwned;
@@ -76,6 +77,49 @@ impl DaemonClient {
             reconnect: false,
             status_tx: broadcast::Sender::new(STATUS_MSG_CHANNEL_SIZE),
         })
+    }
+
+    // ---- WireView Pro II (this fork) ----
+
+    pub async fn wireview_info(&self) -> anyhow::Result<Option<WireViewInfo>> {
+        self.make_request(Request::WireViewInfo).await
+    }
+
+    pub async fn wireview_status(&self) -> anyhow::Result<WireViewStatus> {
+        self.make_request(Request::WireViewStatus).await
+    }
+
+    pub async fn wireview_set_config(
+        &self,
+        config: WireViewConfig,
+        expected_raw: Option<String>,
+        live: bool,
+    ) -> anyhow::Result<WireViewWriteResult> {
+        self.make_request(Request::WireViewSetConfig {
+            config: Box::new(config),
+            expected_raw,
+            live,
+        })
+        .await
+    }
+
+    pub async fn wireview_nvm(&self, op: WireViewNvmOp) -> anyhow::Result<WireViewWriteResult> {
+        self.make_request(Request::WireViewNvm { op }).await
+    }
+
+    pub async fn wireview_flash(&self) -> anyhow::Result<WireViewFlashInfo> {
+        self.make_request(Request::WireViewFlash).await
+    }
+
+    pub async fn wireview_clear_faults(&self) -> anyhow::Result<()> {
+        self.make_request(Request::WireViewClearFaults).await
+    }
+
+    pub async fn wireview_screen(&self, screen: &str) -> anyhow::Result<()> {
+        self.make_request(Request::WireViewScreen {
+            screen: screen.to_owned(),
+        })
+        .await
     }
 
     pub fn status_receiver(&self) -> broadcast::Receiver<ConnectionStatusMsg> {

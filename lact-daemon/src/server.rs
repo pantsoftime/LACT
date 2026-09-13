@@ -2,6 +2,7 @@
 mod display;
 pub mod gpu_controller;
 pub mod handler;
+pub mod wireview;
 mod metrics;
 mod opencl;
 mod profiles;
@@ -265,6 +266,17 @@ async fn handle_request<'a>(
         Request::EnableOverdrive => ok_response(system::enable_overdrive().await?),
         Request::DisableOverdrive => ok_response(system::disable_overdrive().await?),
         Request::GenerateSnapshot => ok_response(handler.generate_snapshot().await?),
+        Request::WireViewInfo => ok_response(handler.wireview.info().await?),
+        Request::WireViewStatus => ok_response(handler.wireview.status().await?),
+        Request::WireViewSetConfig {
+            config,
+            expected_raw,
+            live,
+        } => ok_response(handler.wireview.set_config(*config, expected_raw, live).await?),
+        Request::WireViewNvm { op } => ok_response(handler.wireview.nvm(op).await?),
+        Request::WireViewFlash => ok_response(handler.wireview.flash().await?),
+        Request::WireViewClearFaults => ok_response(handler.wireview.clear_faults().await?),
+        Request::WireViewScreen { screen } => ok_response(handler.wireview.screen(screen).await?),
         Request::ConfirmPendingConfig(command) => {
             ok_response(handler.confirm_pending_config(command)?)
         }

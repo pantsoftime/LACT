@@ -220,3 +220,35 @@ Cost: the boost-limit sweep (two 84 KB requests, ~27 ms) and the 400 KB
 power-policy STATUS (~6 ms) are the two expensive RM reads; the daemon
 refreshes each at most every 0.9 s regardless of the GUI's stats polling
 interval, so a 250 ms poll no longer multiplies them.
+
+## WireView II page (2026-09-13)
+
+A second fork-only page, listed in the sidebar only while a Thermal Grizzly
+WireView Pro II is plugged in (an STM32 virtual COM port under
+`/dev/serial/by-id`). It is a port of the `wv2gui` / `wv2ctl` tooling:
+
+- **Daemon** (`lact-daemon/src/server/wireview.rs`): the serial protocol
+  (115200 baud, welcome / vendor / UID / build / sensors / config / NVM /
+  clear-faults / screen commands), the version-2 config codec with its
+  CRC-16/CCITT-FALSE (shared with the GUI in `lact_schema::wireview`), and
+  the write discipline: back up the previous config to
+  `/var/lib/lact/wireview/`, write, read back, and unless "live" store to
+  flash and read the flash copy back. `NVM_LOAD` is always followed by
+  putting the live config back, because it copies flash verbatim even when
+  flash holds an older struct. The port is opened on demand and released
+  after 5 s without requests, so `wv2ctl` still works while the page is not
+  being looked at (while it is, the CLI gets "device busy").
+- **Requests**: `wireview_info` (`None` when absent), `wireview_status`
+  (readings + live config), `wireview_set_config` (with the expected
+  previous raw config, refused if the device's changed), `wireview_nvm`
+  (save / revert / factory reset), `wireview_flash`, `wireview_clear_faults`,
+  `wireview_screen`.
+- **Page**: live panel (power and current bars scaled to the OPP / OCP
+  limits, six per-pin bars scaled to the per-wire limit, amber at 80 % and
+  red at 95 %; temperatures, fan, average voltage, PSU capability, active
+  and logged faults with a Clear button) and the five settings tabs of the
+  Qt tool (Protection with the fault-action matrix, Fan, Display, Theme,
+  Device). Edited fields are highlighted; Apply live / Save to flash show
+  the exact changes before writing; Backup / Restore use the same JSON as
+  `wv2ctl`, so either tool can read the other's files. The page polls once
+  a second only while visible.

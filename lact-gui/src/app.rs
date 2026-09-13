@@ -52,6 +52,7 @@ use msg::AppMsg;
 use pages::{
     PageUpdate,
     adv_voltage_page::{AdvVoltagePage, AdvVoltagePageMsg},
+    wireview_page::WireViewPage,
     crash_page::CrashPage,
     info_page::InformationPage,
     oc_page::{OcPage, OcPageMsg},
@@ -115,6 +116,7 @@ pub struct AppModel {
     info_page: relm4::Controller<InformationPage>,
     oc_page: relm4::Controller<OcPage>,
     adv_voltage_page: relm4::Controller<AdvVoltagePage>,
+    wireview_page: relm4::Controller<WireViewPage>,
     thermals_page: relm4::Controller<ThermalsPage>,
     software_page: relm4::Controller<SoftwarePage>,
     displays_page: relm4::Controller<DisplaysPage>,
@@ -303,6 +305,7 @@ impl AsyncComponent for AppModel {
                                             add_titled[Some("software_page"), &fl!(I18N, "software-page")] = model.software_page.widget(),
                                             add_titled[Some("displays_page"), &fl!(I18N, "displays-page")] = model.displays_page.widget(),
                                             add_titled[Some("adv_voltage_page"), &fl!(I18N, "adv-voltage-page")] = model.adv_voltage_page.widget(),
+                                            add_titled[Some("wireview_page"), &fl!(I18N, "wireview-page")] = model.wireview_page.widget(),
                                             add_named[Some("crash_page")] = model.crash_page.widget(),
 
                                             set_visible_child_name: &CONFIG.read().selected_tab,
@@ -427,6 +430,7 @@ impl AsyncComponent for AppModel {
             OcPage::launch(settings_changed.clone()).forward(sender.input_sender(), |msg| msg);
         let adv_voltage_page =
             AdvVoltagePage::launch_default().forward(sender.input_sender(), |msg| msg);
+        let wireview_page = WireViewPage::builder().launch(daemon_client.clone()).detach();
         let thermals_page = ThermalsPage::detach_default();
 
         let software_page = SoftwarePage::detach((system_info.clone(), daemon_client.embedded));
@@ -495,6 +499,7 @@ impl AsyncComponent for AppModel {
             info_page,
             oc_page,
             adv_voltage_page,
+            wireview_page,
             thermals_page,
             software_page,
             crash_page,

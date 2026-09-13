@@ -116,6 +116,8 @@ pub struct Handler {
     polkit_proxy: Option<AuthorityProxy<'static>>,
     ignored_gpu_ids: Rc<RwLock<Vec<String>>>,
     reload_tx: Rc<mpsc::Sender<Duration>>,
+    /// Thermal Grizzly WireView Pro II (this fork); the port is opened on demand
+    pub wireview: super::wireview::WireViewManager,
 }
 
 impl<'a> Handler {
@@ -216,7 +218,18 @@ impl<'a> Handler {
             polkit_proxy,
             ignored_gpu_ids: Rc::new(RwLock::new(Vec::new())),
             reload_tx: Rc::new(reload_tx),
+            wireview: super::wireview::WireViewManager::new(),
         };
+        {
+            // Release the WireView port when the GUI stops looking at it.
+            let wireview = handler.wireview.clone();
+            tokio::task::spawn_local(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    wireview.close_if_idle();
+                }
+            });
+        }
 
         if let Err(err) = handler.apply_current_config().await {
             error!("could not apply config: {err:#}");

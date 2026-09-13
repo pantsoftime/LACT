@@ -4,6 +4,7 @@ thermals-page = Thermals
 software-page = Software Info
 displays-page = Display Info
 adv-voltage-page = Advanced
+wireview-page = WireView II
 
 hardware-info = Hardware Information
 

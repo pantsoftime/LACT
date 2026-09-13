@@ -4,6 +4,7 @@ pub mod config;
 pub mod i18n;
 mod profiles;
 pub mod request;
+pub mod wireview;
 mod response;
 
 #[cfg(test)]
@@ -772,6 +773,126 @@ pub struct DeviceStats {
     /// the driver exposes them. NVIDIA RM only, for now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub perf_limits: Vec<PerfLimitEntry>,
+}
+
+/// A Thermal Grizzly WireView Pro II found on a USB CDC-ACM port (this fork).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WireViewInfo {
+    pub port: String,
+    pub product: String,
+    pub firmware: u8,
+    pub build: String,
+    pub uid: String,
+    pub config_version: u8,
+}
+
+/// One sensor frame: volts, amps, watts, °C. Temperature probes that are not
+/// plugged in read `None`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WireViewReadings {
+    /// in, out, ext 1, ext 2
+    pub temps: [Option<f32>; 4],
+    pub vdd: f32,
+    pub fan: u8,
+    pub pin_v: [f32; 6],
+    pub pin_a: [f32; 6],
+    pub pin_w: [f32; 6],
+    pub power: f32,
+    pub current: f32,
+    pub avg_v: f32,
+    pub psu_cap: String,
+    pub fault_status: u16,
+    pub fault_log: u16,
+}
+
+/// The device's 96-byte configuration (struct version 2, firmware v5),
+/// field for field. Tenths fields (`fan_temp_*`, `ts_fault`, `wire_ocp`) are
+/// stored ×10; fault masks use the bit order chip over-temperature,
+/// over-temperature, OCP, wire OCP, OPP, imbalance; colours are 0xAARRGGBB.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct WireViewConfig {
+    pub version: u8,
+    pub name: String,
+    pub fan_mode: u8,
+    pub fan_source: u8,
+    pub fan_duty_min: u8,
+    pub fan_duty_max: u8,
+    pub fan_temp_min: i16,
+    pub fan_temp_max: i16,
+    pub backlight: u8,
+    pub fault_display: u16,
+    pub fault_buzzer: u16,
+    pub fault_soft_off: u16,
+    pub fault_hard_off: u16,
+    pub ts_fault: i16,
+    pub ocp: u8,
+    pub wire_ocp: u8,
+    pub opp: u16,
+    pub imbalance: u8,
+    pub imbalance_min_load: u8,
+    pub shutdown_wait: u8,
+    pub log_interval: u8,
+    pub avg: u8,
+    pub default_screen: u8,
+    pub current_scale: u8,
+    pub power_scale: u8,
+    pub rotation: u8,
+    pub timeout_mode: u8,
+    pub cycle_screens: u8,
+    pub cycle_time: u8,
+    pub timeout: u8,
+    pub color_primary: u32,
+    pub color_secondary: u32,
+    pub color_highlight: u32,
+    pub color_background: u32,
+    pub background: u8,
+    pub fan_bitmap: u8,
+    pub invert: u8,
+}
+
+/// The live configuration as read from the device: raw bytes (hex) and decoded.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WireViewConfigState {
+    pub raw: String,
+    pub config: WireViewConfig,
+    pub crc_ok: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WireViewStatus {
+    pub readings: WireViewReadings,
+    pub state: WireViewConfigState,
+}
+
+/// What the device holds in flash, which may be an older struct version
+/// that the running firmware ignores.
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WireViewFlashInfo {
+    pub version: u8,
+    pub crc_ok: bool,
+    pub raw: String,
+    pub config: Option<WireViewConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireViewNvmOp {
+    /// Save the live config to flash and verify it
+    Save,
+    /// Reload the saved config from flash (refused if flash holds an older struct)
+    Revert,
+    /// Load the firmware defaults into the live config (not saved)
+    FactoryReset,
+}
+
+/// Result of a write: the config now on the device and where the previous
+/// one was backed up.
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WireViewWriteResult {
+    pub state: WireViewConfigState,
+    pub backup: Option<String>,
 }
 
 /// One populated performance-limit client of the clock arbiter.
