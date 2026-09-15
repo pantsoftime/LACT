@@ -28,6 +28,9 @@ const CONTROL_SIZE: usize = 0x328;
 const REQUEST_AT: usize = 0x2c;
 const CLIENT_AT: usize = 0x30;
 const ORDINARY_CLIENT: u8 = 0xfe;
+/// End of the client mask that follows the header: with only client 0
+/// requested, the mask words after the first must read back zero.
+const MASK_END: usize = 0x24;
 /// The lowest request this fork will make, mW.
 const LOWER_LIMIT_MW: u32 = 30_000;
 /// Driver branches the layout was verified on (see the module docs).
@@ -119,8 +122,12 @@ fn read_control(query: &mut impl FnMut(u32, &mut [u8]) -> anyhow::Result<()>) ->
 }
 
 fn validate_header(data: &[u8]) -> anyhow::Result<()> {
+    // The extended layout carries the requested-client mask in the words
+    // after +4; anything set beyond the first word means either a different
+    // layout or a request for more than the ordinary client (Panchovix
+    // cf5ecbe, 2026-09-15).
     ensure!(
-        read_u32(data, 0) == 0xff && read_u32(data, 4) == 1,
+        read_u32(data, 0) == 0xff && read_u32(data, 4) == 1 && data[8..MASK_END].iter().all(|byte| *byte == 0),
         "Unrecognized RM power client layout"
     );
     Ok(())
@@ -259,6 +266,15 @@ mod tests {
         );
         let mut rm = FakeRm::new(250_000);
         assert!(probe("615.71.09", BOUNDS, 300_000, |c, d| rm.query(c, d)).is_err());
+        assert!(rm.writes.is_empty());
+    }
+
+    #[test]
+    fn extra_mask_bits_reject_the_layout_before_any_write() {
+        let mut rm = FakeRm::new(250_000);
+        rm.control[0x20] = 1;
+        assert!(probe("615.71.09", BOUNDS, 250_000, |c, d| rm.query(c, d)).is_err());
+        assert!(set_limit(200_000, BOUNDS, |c, d| rm.query(c, d)).is_err());
         assert!(rm.writes.is_empty());
     }
 
