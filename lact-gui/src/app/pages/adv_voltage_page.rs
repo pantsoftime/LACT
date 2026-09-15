@@ -224,6 +224,11 @@ impl Card {
         self.loading.set(false);
     }
 
+    /// Refresh the caption line only (live readings), leaving edits alone.
+    fn set_caption(&self, text: &str) {
+        self.current_label.set_label(text);
+    }
+
     fn value(&self) -> Option<i32> {
         #[allow(clippy::cast_possible_truncation)]
         self.switch
@@ -1204,6 +1209,9 @@ pub struct AdvVoltagePage {
     limits_summary: gtk::Label,
     limits_list: gtk::Label,
     curves: CurveChart,
+    /// The rail current-limit records from the last clocks table, so the OCP
+    /// cards' caption can follow the live reading between table fetches.
+    ocp_limits: [Option<lact_schema::NvidiaRailCurrentLimit>; 2],
     table: Option<NvidiaClocksTable>,
 }
 
@@ -1618,6 +1626,7 @@ impl relm4::Component for AdvVoltagePage {
             limits_summary,
             limits_list,
             curves,
+            ocp_limits: [None, None],
             table: None,
         };
 
@@ -1682,6 +1691,11 @@ impl AdvVoltagePage {
 
         let currents = &stats.power.current_sensors;
         let powers = &stats.power.sensors;
+        for (card, rail, slot) in [(&self.nvvdd_ocp, "NVVDD", 0usize), (&self.msvdd_ocp, "MSVDD", 1usize)] {
+            if let (Some(l), Some(a)) = (self.ocp_limits[slot].as_ref(), currents.get(rail)) {
+                card.set_caption(&ocp_caption(l, Some(*a)));
+            }
+        }
         for (label, rail) in [(&self.tele_nvvdd_rail, "NVVDD"), (&self.tele_msvdd_rail, "MSVDD")] {
             label.set_label(&match (currents.get(rail), powers.get(&format!("{rail} rail"))) {
                 (Some(a), Some(w)) => format!("{a:.0} A · {w:.0} W"),
@@ -1793,7 +1807,7 @@ impl AdvVoltagePage {
         self.limits_list.set_label(&rows.join("\n"));
     }
 
-    fn show_table(&self, table: Option<&NvidiaClocksTable>) {
+    fn show_table(&mut self, table: Option<&NvidiaClocksTable>) {
         let Some(t) = table else {
             for card in [
                 &self.core,
@@ -1848,6 +1862,7 @@ impl AdvVoltagePage {
                 None => card.unavailable("Rail objects not available on this driver"),
             }
         }
+        let mut ocp_limits = [None, None];
         for (card, index) in [(&self.nvvdd_ocp, 0u8), (&self.msvdd_ocp, 1u8)] {
             let limit = t
                 .voltage_rails
@@ -1861,22 +1876,14 @@ impl AdvVoltagePage {
                     f64::from(l.max_a),
                     f64::from(l.default_a),
                     l.current_a != l.default_a,
-                    &format!(
-                        "Current {} A (rated {} A){}{}   Range {}…{} A",
-                        l.current_a,
-                        l.rated_a,
-                        l.arbitrated_a
-                            .filter(|a| *a != l.current_a)
-                            .map_or(String::new(), |a| format!(", driver holds {a} A")),
-                        l.measured_a
-                            .map_or(String::new(), |a| format!("   Drawing {a} A")),
-                        l.min_a,
-                        l.max_a
-                    ),
+                    &ocp_caption(l, None),
                 ),
                 None => card.unavailable("Power-policy objects not available on this driver"),
             }
+            ocp_limits[usize::from(index)] = limit.copied();
         }
+
+        self.ocp_limits = ocp_limits;
 
         // NVML-backed cards. On this driver the per-pstate offset is one global
         // register, so pstate 0 stands for all of them.
@@ -1970,6 +1977,24 @@ impl AdvVoltagePage {
         self.nvvdd_rail.apply(config);
         self.msvdd_rail.apply(config);
     }
+}
+
+/// The OCP card caption; `live_a` overrides the table's snapshot reading.
+fn ocp_caption(l: &lact_schema::NvidiaRailCurrentLimit, live_a: Option<f64>) -> String {
+    let drawing = live_a
+        .map(|a| format!("   Drawing {a:.0} A"))
+        .or_else(|| l.measured_a.map(|a| format!("   Drawing {a} A")))
+        .unwrap_or_default();
+    format!(
+        "Current {} A (rated {} A){}{drawing}   Range {}…{} A",
+        l.current_a,
+        l.rated_a,
+        l.arbitrated_a
+            .filter(|a| *a != l.current_a)
+            .map_or(String::new(), |a| format!(", driver holds {a} A")),
+        l.min_a,
+        l.max_a
+    )
 }
 
 fn load_offset(card: &Card, offset: Option<&NvidiaClockOffset>, unit: &str, unavailable: &str) {
