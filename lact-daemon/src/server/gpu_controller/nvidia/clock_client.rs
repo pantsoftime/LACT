@@ -75,6 +75,10 @@ const API_DOMAIN_VIDEO: u32 = 0x0010_0000;
 /// 0, so they are read-only anyway).
 const API_DOMAIN_DISP: u32 = 0x0000_0040;
 const API_DOMAIN_HUB: u32 = 0x0000_0008;
+/// PMU clock; follows XBAR through the propagation topology (Panchovix's A/B).
+const API_DOMAIN_PWR: u32 = 0x0008_0000;
+/// "Legacy" clock; also hangs off XBAR. Measures 0 on GB202.
+const API_DOMAIN_LEGACY: u32 = 0x0020_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RmDomainKind {
@@ -85,6 +89,8 @@ pub enum RmDomainKind {
     Memory,
     Disp,
     Hub,
+    Pwr,
+    Legacy,
 }
 
 impl RmDomainKind {
@@ -97,6 +103,8 @@ impl RmDomainKind {
             API_DOMAIN_VIDEO => Some(Self::Video),
             API_DOMAIN_DISP => Some(Self::Disp),
             API_DOMAIN_HUB => Some(Self::Hub),
+            API_DOMAIN_PWR => Some(Self::Pwr),
+            API_DOMAIN_LEGACY => Some(Self::Legacy),
             _ => None,
         }
     }
@@ -112,6 +120,8 @@ impl fmt::Display for RmDomainKind {
             Self::Memory => "DRAMCLK",
             Self::Disp => "DISPCLK",
             Self::Hub => "HUBCLK",
+            Self::Pwr => "PWRCLK",
+            Self::Legacy => "LEGCLK",
         })
     }
 }

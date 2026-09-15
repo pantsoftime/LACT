@@ -537,6 +537,25 @@ pub struct NvidiaClocksTable {
     /// Every domain the RM ClockClient interface reports, for the live table
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rm_clock_domains: Vec<NvidiaRmClockDomain>,
+    /// The V/F curve of every clock domain that keeps one (read-only)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_vf_curves: Vec<NvidiaDomainVfCurve>,
+}
+
+/// One clock domain's V/F curve as the driver reports it. Display only:
+/// there is no way to verify a write to these points.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct NvidiaDomainVfCurve {
+    pub domain: String,
+    /// The voltage rail the curve is on (NVVDD for GPC, MSVDD for the rest on GB202)
+    pub rail: String,
+    pub points: Vec<NvidiaDomainVfPoint>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaDomainVfPoint {
+    pub voltage_mv: u32,
+    pub freq_mhz: u32,
 }
 
 /// The GPC→XBAR clock propagation ratio of the active clock topology.

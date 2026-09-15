@@ -144,6 +144,18 @@ const ID_COUNT: usize = 0x140;
 /// Clients identified by manipulation on GB202 (see the module docs).
 pub const POWER_POLICY_IDS: [u32; 2] = [0x110, 0x111];
 
+/// The Blackwell clients above NVML's table come in two triples shaped like
+/// the named thermal-policy set (`THERM_POLICY_DOM_GRP_0` P-state /
+/// `_DOM_GRP_1` GPC / `_XBAR`): a P-state limit (type 1), a GPC frequency
+/// limit and an XBAR frequency limit. 0x10f/0x110/0x111 are the board
+/// power-cap policy's set — 0x110/0x111 tracked a 400 W cap. 0x112/0x113/
+/// 0x114 are a second policy's set whose XBAR member (0x114) moved when the
+/// MSVDD rail current limit bit and nothing else did; its identity beyond
+/// "another power policy" is not established. The driver ships no name
+/// strings for any of these (NVML's table stops before them).
+pub const BOARD_POWER_POLICY_IDS: [u32; 3] = [0x10f, 0x110, 0x111];
+pub const SECOND_POWER_POLICY_IDS: [u32; 3] = [0x112, 0x113, 0x114];
+
 const OFF_TYPE: usize = 0x04;
 const OFF_VALUE: usize = 0x0c;
 const OFF_DOMAIN_MASK: usize = 0x10;

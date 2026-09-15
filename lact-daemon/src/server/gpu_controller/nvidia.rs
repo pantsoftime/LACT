@@ -5,6 +5,7 @@ mod rm_perf;
 mod rm_perf_names;
 mod rm_prop;
 mod rm_pwr;
+mod rm_vf;
 mod rm_volt;
 
 use super::{CommonControllerInfo, FanControlHandle, GpuController};
@@ -26,12 +27,13 @@ use amdgpu_sysfs::{
 use anyhow::{Context, anyhow, bail, ensure};
 use clock_client::{ControlBlock, RmClockDomain, RmDomainKind};
 use lact_schema::{
-    NvidiaPropagationRatio, NvidiaRailCurrentLimit, NvidiaRailLimitDelta, NvidiaVoltageRail, PerfLimitEntry, RailLimit,
+    NvidiaDomainVfCurve, NvidiaDomainVfPoint, NvidiaPropagationRatio, NvidiaRailCurrentLimit, NvidiaRailLimitDelta, NvidiaVoltageRail, PerfLimitEntry, RailLimit,
 };
 use rm_perf::{PerfLimitKind, PerfLimits};
 use rm_prop::PropRelation;
 use rm_pwr::PowerPolicies;
 use rm_volt::VoltRails;
+use driver::power_limit::PowerLimitBounds;
 use driver::DriverHandle;
 use futures::{FutureExt, future::LocalBoxFuture};
 use indexmap::IndexMap;
@@ -101,6 +103,8 @@ pub struct NvidiaGpuController {
     rm_perf: Option<PerfLimits>,
     /// The PMGR power policies (TGP, per-rail current limits), if their layout checked out
     rm_pwr: Option<PowerPolicies>,
+    /// Bounds of the client power-policy route that accepts caps below the vBIOS minimum
+    lower_power_limit: Option<PowerLimitBounds>,
     perf_limits_cache: RefCell<Option<Cached<Vec<PerfLimitEntry>>>>,
     rail_power_cache: RefCell<Option<Cached<(HashMap<String, f64>, HashMap<String, f64>)>>>,
     nvapi_therm_channel_mask: Option<i32>,
@@ -159,7 +163,7 @@ impl NvidiaGpuController {
 
         let minor_number = device.minor_number()?;
 
-        let driver_handle = match DriverHandle::open(minor_number) {
+        let driver_handle = match DriverHandle::open(minor_number, &common.get_slot_info()?) {
             Ok(handle) => {
                 debug!("opened Nvidia driver handle");
                 Some(handle)
@@ -238,6 +242,37 @@ impl NvidiaGpuController {
             _ => None,
         };
 
+        let lower_power_limit = driver_handle.as_ref().and_then(|handle| {
+            let probe = (|| -> anyhow::Result<_> {
+                let constraints = device.power_management_limit_constraints()?;
+                handle.probe_lower_power_limit(
+                    &nvml.sys_driver_version()?,
+                    PowerLimitBounds {
+                        min_mw: constraints.min_limit,
+                        default_mw: device.power_management_limit_default()?,
+                        max_mw: constraints.max_limit,
+                    },
+                    device.power_management_limit()?,
+                )
+            })();
+            match probe {
+                Ok(Some(bounds)) => {
+                    tracing::info!(
+                        "power caps below the vBIOS minimum enabled ({} W … {} W; NVML minimum {} W)",
+                        bounds.lower_min_mw() / 1000,
+                        bounds.max_mw / 1000,
+                        bounds.min_mw / 1000
+                    );
+                    Some(bounds)
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    warn!("power caps below the vBIOS minimum disabled: {err:#}");
+                    None
+                }
+            }
+        });
+
         let rm_pwr = match (driver_handle.as_ref(), rm_clock_domains.as_ref()) {
             (Some(handle), Some(_)) => {
                 let cap_mw = device.power_management_limit().ok();
@@ -269,6 +304,7 @@ impl NvidiaGpuController {
             rm_prop,
             rm_perf,
             rm_pwr,
+            lower_power_limit,
             perf_limits_cache: RefCell::new(None),
             rail_power_cache: RefCell::new(None),
             nvapi_therm_channel_mask,
@@ -650,9 +686,14 @@ impl NvidiaGpuController {
                             Some(uv / 1000),
                         )
                     }
+                    // Types 1 and 3 carry a P-state (or vP-state) level rather than a
+                    // clock; the level's meaning is not decoded, so it is shown raw.
                     PerfLimitKind::Other { type_code, value } => (
-                        format!("limit {:#04x} (type {type_code}, value {value})", l.id),
-                        None,
+                        match type_code {
+                            1 | 3 => format!("P-state limit (level {value})"),
+                            _ => format!("limit {:#04x} (type {type_code}, value {value})", l.id),
+                        },
+                        matches!(type_code, 1 | 3).then(|| "P-state".to_owned()),
                         None,
                         None,
                     ),
@@ -662,8 +703,11 @@ impl NvidiaGpuController {
                 // does not (0x110/0x111 power cap controller, 0x113/0x114).
                 let name = match nvml {
                     Some(n) => rm_perf::friendly_name(n),
-                    None if rm_perf::POWER_POLICY_IDS.contains(&l.id) => {
+                    None if rm_perf::BOARD_POWER_POLICY_IDS.contains(&l.id) => {
                         format!("Power cap controller ({})", domain.as_deref().unwrap_or("?"))
+                    }
+                    None if rm_perf::SECOND_POWER_POLICY_IDS.contains(&l.id) => {
+                        format!("Power policy 2 ({})", domain.as_deref().unwrap_or("?"))
                     }
                     None => name,
                 };
@@ -1409,35 +1453,112 @@ fn supported_power_mizer_modes(modes: PowerMizerModes) -> Vec<PowerMizerMode> {
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn apply_power_cap(device: &mut Device<'_>, power_cap: Option<f64>) -> anyhow::Result<()> {
-    if let Some(cap) = power_cap {
-        let cap = (cap * 1000.0) as u32;
+fn checked_power_cap_mw(cap: f64, min_mw: u32, max_mw: u32) -> anyhow::Result<u32> {
+    ensure!(
+        cap.is_finite()
+            && cap > 0.0
+            && cap >= f64::from(min_mw) / 1000.0
+            && cap <= f64::from(max_mw) / 1000.0,
+        "Power cap must be between {} and {} W",
+        f64::from(min_mw) / 1000.0,
+        f64::from(max_mw) / 1000.0,
+    );
+    Ok((cap * 1000.0) as u32)
+}
 
-        let current_cap = device
-            .power_management_limit()
-            .context("Could not get current cap")?;
-
-        if current_cap != cap {
-            debug!("setting power cap to {cap}");
-            device
-                .set_power_management_limit(cap)
-                .context("Could not set power cap")?;
-        }
-    } else {
-        let current_cap = device.power_management_limit();
-        let default_cap = device.power_management_limit_default();
-
-        if let (Ok(current_cap), Ok(default_cap)) = (current_cap, default_cap)
-            && current_cap != default_cap
-        {
-            debug!("resetting power cap to {default_cap}");
-            device
-                .set_power_management_limit(default_cap)
-                .context("Could not reset power cap")?;
-        }
+impl NvidiaGpuController {
+    /// The lower bound the daemon accepts for the power cap: NVML's minimum,
+    /// or lower when the private client route was verified for this GPU.
+    fn power_cap_min_mw(&self, nvml_min_mw: u32, nvml_max_mw: u32) -> u32 {
+        self.lower_power_limit
+            .filter(|b| b.min_mw == nvml_min_mw && b.max_mw == nvml_max_mw)
+            .map_or(nvml_min_mw, PowerLimitBounds::lower_min_mw)
     }
 
-    Ok(())
+    /// Inside the vBIOS range NVML sets the cap as before; below its minimum
+    /// the ordinary client of the power-policy group is written instead.
+    /// Resets to the default always go through NVML.
+    fn apply_power_cap(&self, device: &mut Device<'_>, power_cap: Option<f64>) -> anyhow::Result<()> {
+        if let Some(cap) = power_cap {
+            let constraints = device
+                .power_management_limit_constraints()
+                .context("Could not get power cap constraints")?;
+            let min_mw = self.power_cap_min_mw(constraints.min_limit, constraints.max_limit);
+            let cap = checked_power_cap_mw(cap, min_mw, constraints.max_limit)?;
+            let current_cap = device
+                .power_management_limit()
+                .context("Could not get current cap")?;
+            if current_cap != cap {
+                debug!("setting power cap to {cap}");
+                if cap < constraints.min_limit {
+                    let bounds = self
+                        .lower_power_limit
+                        .context("Lower power cap is not supported")?;
+                    self.driver_handle
+                        .as_ref()
+                        .context("Nvidia RM is unavailable for a power cap below the vBIOS minimum")?
+                        .set_lower_power_limit(cap, bounds)
+                        .context("Could not set lower power cap")?;
+                    tracing::info!("power cap {} W set below the vBIOS minimum through the client power policy", cap / 1000);
+                } else {
+                    device
+                        .set_power_management_limit(cap)
+                        .context("Could not set power cap")?;
+                }
+            }
+        } else {
+            let current_cap = device.power_management_limit();
+            let default_cap = device.power_management_limit_default();
+
+            if let (Ok(current_cap), Ok(default_cap)) = (current_cap, default_cap)
+                && current_cap != default_cap
+            {
+                debug!("resetting power cap to {default_cap}");
+                device
+                    .set_power_management_limit(default_cap)
+                    .context("Could not reset power cap")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Every domain's V/F curve, named and tagged with its rail (display only).
+    fn rm_domain_vf_curves(&self) -> Vec<NvidiaDomainVfCurve> {
+        let Some((handle, domains)) = self.rm() else {
+            return Vec::new();
+        };
+        let curves = match rm_vf::read_domain_curves(handle, domains) {
+            Ok(curves) => curves,
+            Err(err) => {
+                debug!("could not read domain V/F curves: {err:#}");
+                return Vec::new();
+            }
+        };
+        curves
+            .into_iter()
+            .filter_map(|curve| {
+                let domain = domains.iter().find(|d| d.index == curve.domain_index)?;
+                let rail = match domain.rail_mask {
+                    1 => "NVVDD",
+                    2 => "MSVDD",
+                    _ => "?",
+                };
+                Some(NvidiaDomainVfCurve {
+                    domain: domain.name(),
+                    rail: rail.to_owned(),
+                    points: curve
+                        .points
+                        .into_iter()
+                        .map(|p| NvidiaDomainVfPoint {
+                            voltage_mv: p.voltage_mv,
+                            freq_mhz: p.freq_mhz,
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
 }
 
 impl GpuController for NvidiaGpuController {
@@ -1770,7 +1891,7 @@ impl GpuController for NvidiaGpuController {
                     .map(|constraints| f64::from(constraints.max_limit) / 1000.0),
                 cap_min: power_constraints
                     .as_ref()
-                    .map(|constraints| f64::from(constraints.min_limit) / 1000.0),
+                    .map(|constraints| f64::from(self.power_cap_min_mw(constraints.min_limit, constraints.max_limit)) / 1000.0),
                 cap_default: device
                     .power_management_limit_default()
                     .map(|mw| f64::from(mw) / 1000.0)
@@ -1921,6 +2042,7 @@ impl GpuController for NvidiaGpuController {
                 .and_then(|b| self.rm_rail_offset(b, RmDomainKind::Video)),
             gpc_xbar_ratio: self.rm_propagation_ratio(),
             voltage_rails: self.rm_voltage_rails(),
+            domain_vf_curves: self.rm_domain_vf_curves(),
             rm_clock_domains: rm_block
                 .as_ref()
                 .map(|b| self.rm_domain_table(b))
@@ -1953,7 +2075,7 @@ impl GpuController for NvidiaGpuController {
         Box::pin(async {
             let mut device = self.device();
 
-            apply_power_cap(&mut device, config.power_cap)?;
+            self.apply_power_cap(&mut device, config.power_cap)?;
             apply_power_mizer_mode(&mut device, config.power_mizer_mode)?;
 
             self.reset_clocks()?;

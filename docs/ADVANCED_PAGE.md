@@ -151,6 +151,16 @@ sits where it does, and lists the rest. Which client the driver actually
 selects is not flagged by this object; the power-policy client was not
 observed in testing (a 300 W cap did not engage within the test window).
 
+Update 2026-09-14: the driver ships no name strings for the Blackwell
+clients above NVML's table (the GSP firmware and every driver library were
+searched; `PERF_LIMITS_GET_INFO` variants refuse every request size). Their
+structure is visible in the data instead: two triples of (P-state limit,
+GPC limit, XBAR limit), the same shape as the named thermal-policy set.
+0x10f–0x111 are shown as "Power cap controller" (0x110/0x111 tracked a 400 W
+cap); 0x112–0x114 as "Power policy 2" (0x114 followed the MSVDD current
+limit). Type-1/3 rows are shown as "P-state limit (level N)"; the level's
+meaning is not decoded.
+
 ## Tests section and the XBAR guard (2026-09-11)
 
 The XBAR card no longer has a validated-maximum switch: the slider spans the
@@ -252,3 +262,37 @@ WireView Pro II is plugged in (an STM32 virtual COM port under
   the exact changes before writing; Backup / Restore use the same JSON as
   `wv2ctl`, so either tool can read the other's files. The page polls once
   a second only while visible.
+
+## Ports from Panchovix/LACT (2026-09-14)
+
+Three pieces of [Panchovix's fork](https://github.com/Panchovix/LACT)
+(`feat/nvidia-lower-power-limit`), re-verified on R615 and adapted:
+
+- **RM device identity by PCI** (`driver/device_id.rs`): the daemon used the
+  Linux minor as the RM `deviceId`, which on multi-GPU hosts can pick the
+  wrong card (his 5090 was minor 4, RM instance 5). The root-client queries
+  `GET_ATTACHED_IDS` / `GET_PCI_INFO` / `GET_ID_INFO_V2` now resolve the
+  device and subdevice instances from the PCI slot before anything is
+  allocated. Harmless on a single-GPU machine, correct on any other.
+- **Power caps below the vBIOS minimum** (`driver/power_limit.rs`): the
+  client power-policy group (`0x2080a630` / `a632` / `e633`, ordinary client
+  0xFE) accepts board power requests under the minimum NVML enforces, and the
+  card holds them (his PRO 6000: 100 W on a 250 W minimum; 30 W settled near
+  74 W). The Power limit card's range now starts at 30 W: inside the vBIOS
+  range the cap still goes through NVML, below it through this route, and a
+  reset to default always through NVML. It is enabled only when the RM
+  bounds and current request agree byte for byte with NVML on a verified
+  driver branch, writes change one word with whole-block readback and
+  restore on failure, and the F8 client is never touched. It is a lower
+  route only: the vBIOS maximum stands.
+- **Clock domain V/F curves** (`nvidia/rm_vf.rs`, "Clock domain V/F curves"
+  on this page): `CLK_VF_POINTS` GET_INFO / GET_STATUS, 127-point banks in
+  one flat index space matched to domains in `CLK_DOMAINS` order (GPC, XBAR,
+  memory without a curve, SYS, video, PWRCLK on GB202). Read-only: the
+  driver takes writes to these points but gives no way to check them, and
+  one domain drops a written point on the next read. Curves can be toggled
+  in the legend; hover reads the nearest point on both axes.
+
+Also from his measurements: the previously unnamed domains with API bits
+0x80000 and 0x200000 are PWRCLK and the legacy clock, both of which follow
+XBAR through the propagation ratio; they are named in the domain table now.

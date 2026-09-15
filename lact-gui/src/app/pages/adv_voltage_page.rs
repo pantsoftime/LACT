@@ -23,7 +23,8 @@ use gtk::prelude::*;
 use lact_schema::config::GpuConfig;
 use lact_schema::request::{ClockspeedType, SetClocksCommand};
 use lact_schema::{
-    ClocksTable, DeviceStats, NvidiaClockOffset, NvidiaClocksTable, NvidiaVoltageRail, RailLimit,
+    ClocksTable, DeviceStats, NvidiaClockOffset, NvidiaClocksTable, NvidiaDomainVfCurve,
+    NvidiaVoltageRail, RailLimit,
 };
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt};
 use std::cell::{Cell, RefCell};
@@ -912,6 +913,258 @@ fn mhz(v: Option<u64>) -> String {
     v.map_or("—".to_owned(), |v| format!("{v} MHz"))
 }
 
+// --------------------------------------------------------- domain V/F chart
+
+const CURVE_COLOURS: [(f64, f64, f64); 6] = [
+    (0.36, 0.55, 0.96), // XBAR blue
+    (0.95, 0.60, 0.20), // SYS orange
+    (0.30, 0.75, 0.45), // video green
+    (0.80, 0.40, 0.80), // PWRCLK purple
+    (0.60, 0.60, 0.60), // GPC grey (other rail)
+    (0.90, 0.30, 0.30),
+];
+
+struct CurveChart {
+    frame: gtk::Frame,
+    area: gtk::DrawingArea,
+    legend: gtk::Box,
+    readout: gtk::Label,
+    curves: Rc<RefCell<Vec<NvidiaDomainVfCurve>>>,
+    enabled: Rc<RefCell<Vec<bool>>>,
+}
+
+impl CurveChart {
+    const MARGIN_L: f64 = 56.0;
+    const MARGIN_R: f64 = 14.0;
+    const MARGIN_T: f64 = 10.0;
+    const MARGIN_B: f64 = 30.0;
+
+    fn new() -> Self {
+        let curves: Rc<RefCell<Vec<NvidiaDomainVfCurve>>> = Rc::new(RefCell::new(Vec::new()));
+        let enabled: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let hover: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+        let area = gtk::DrawingArea::builder()
+            .content_height(260)
+            .hexpand(true)
+            .build();
+        let readout = caption("Hover over the chart to read a point", false);
+        readout.set_width_chars(-1);
+        readout.set_max_width_chars(-1);
+        let legend = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        {
+            let (curves, enabled, hover) = (curves.clone(), enabled.clone(), hover.clone());
+            area.set_draw_func(move |_, cr, w, h| {
+                Self::draw(cr, f64::from(w), f64::from(h), &curves.borrow(), &enabled.borrow(), hover.get());
+            });
+        }
+        {
+            let motion = gtk::EventControllerMotion::new();
+            {
+                let (hover, area2, readout, curves, enabled) =
+                    (hover.clone(), area.clone(), readout.clone(), curves.clone(), enabled.clone());
+                motion.connect_motion(move |_, x, y| {
+                    hover.set(Some((x, y)));
+                    let w = f64::from(area2.width());
+                    let h = f64::from(area2.height());
+                    readout.set_label(&Self::nearest(x, y, w, h, &curves.borrow(), &enabled.borrow()));
+                    area2.queue_draw();
+                });
+            }
+            {
+                let (hover, area2) = (hover.clone(), area.clone());
+                motion.connect_leave(move |_| {
+                    hover.set(None);
+                    area2.queue_draw();
+                });
+            }
+            area.add_controller(motion);
+        }
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        body.set_margin_all(8);
+        body.append(&legend);
+        body.append(&area);
+        body.append(&readout);
+        let frame = gtk::Frame::builder().child(&body).build();
+        Self {
+            frame,
+            area,
+            legend,
+            readout,
+            curves,
+            enabled,
+        }
+    }
+
+    fn set(&self, curves: &[NvidiaDomainVfCurve]) {
+        let names_changed = {
+            let current = self.curves.borrow();
+            current.len() != curves.len() || current.iter().zip(curves).any(|(a, b)| a.domain != b.domain)
+        };
+        *self.curves.borrow_mut() = curves.to_vec();
+        if names_changed {
+            while let Some(child) = self.legend.first_child() {
+                self.legend.remove(&child);
+            }
+            // GPC has its own editor on the Overclocking page and sits on the
+            // other rail; it starts hidden so the fabric curves set the scale.
+            *self.enabled.borrow_mut() = curves.iter().map(|c| c.domain != "GPCCLK").collect();
+            for (i, curve) in curves.iter().enumerate() {
+                let check = gtk::CheckButton::builder()
+                    .label(format!("{} ({})", curve.domain, curve.rail))
+                    .active(self.enabled.borrow()[i])
+                    .build();
+                let (r, g, b) = CURVE_COLOURS[i % CURVE_COLOURS.len()];
+                check.set_tooltip_text(Some(&format!("{} points", curve.points.len())));
+                let swatch = gtk::DrawingArea::builder().content_width(14).content_height(14).valign(gtk::Align::Center).build();
+                swatch.set_draw_func(move |_, cr, w, h| {
+                    cr.set_source_rgb(r, g, b);
+                    cr.rectangle(0.0, 0.0, f64::from(w), f64::from(h));
+                    let _ = cr.fill();
+                });
+                let item = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                item.append(&swatch);
+                item.append(&check);
+                self.legend.append(&item);
+                let (enabled, area) = (self.enabled.clone(), self.area.clone());
+                check.connect_toggled(move |c| {
+                    if let Some(slot) = enabled.borrow_mut().get_mut(i) {
+                        *slot = c.is_active();
+                    }
+                    area.queue_draw();
+                });
+            }
+        }
+        self.frame.set_sensitive(!curves.is_empty());
+        if curves.is_empty() {
+            self.readout.set_label("No domain V/F curves reported by the daemon");
+        }
+        self.area.queue_draw();
+    }
+
+    /// Axis ranges over the enabled curves: (mV min, mV max, MHz max).
+    fn ranges(curves: &[NvidiaDomainVfCurve], enabled: &[bool]) -> Option<(f64, f64, f64)> {
+        let mut v_min = f64::MAX;
+        let mut v_max = f64::MIN;
+        let mut f_max: f64 = 0.0;
+        for (c, on) in curves.iter().zip(enabled) {
+            if !on {
+                continue;
+            }
+            for p in &c.points {
+                v_min = v_min.min(f64::from(p.voltage_mv));
+                v_max = v_max.max(f64::from(p.voltage_mv));
+                f_max = f_max.max(f64::from(p.freq_mhz));
+            }
+        }
+        (v_max > v_min && f_max > 0.0).then_some((v_min, v_max, f_max * 1.05))
+    }
+
+    fn project(x: f64, y: f64, w: f64, h: f64, r: (f64, f64, f64)) -> (f64, f64) {
+        let (v_min, v_max, f_max) = r;
+        let px = Self::MARGIN_L + (x - v_min) / (v_max - v_min) * (w - Self::MARGIN_L - Self::MARGIN_R);
+        let py = h - Self::MARGIN_B - y / f_max * (h - Self::MARGIN_T - Self::MARGIN_B);
+        (px, py)
+    }
+
+    fn draw(cr: &gtk::cairo::Context, w: f64, h: f64, curves: &[NvidiaDomainVfCurve], enabled: &[bool], hover: Option<(f64, f64)>) {
+        let Some(r) = Self::ranges(curves, enabled) else {
+            return;
+        };
+        let (v_min, v_max, f_max) = r;
+        // axes and grid
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.35);
+        cr.set_line_width(1.0);
+        let f_step = if f_max > 3000.0 { 500.0 } else { 250.0 };
+        let mut f = 0.0;
+        while f <= f_max {
+            let (_, py) = Self::project(v_min, f, w, h, r);
+            cr.move_to(Self::MARGIN_L, py);
+            cr.line_to(w - Self::MARGIN_R, py);
+            let _ = cr.stroke();
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.9);
+            cr.set_font_size(10.0);
+            cr.move_to(4.0, py + 3.0);
+            let _ = cr.show_text(&format!("{f:.0}"));
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.35);
+            f += f_step;
+        }
+        let mut v = (v_min / 100.0).ceil() * 100.0;
+        while v <= v_max {
+            let (px, _) = Self::project(v, 0.0, w, h, r);
+            cr.move_to(px, Self::MARGIN_T);
+            cr.line_to(px, h - Self::MARGIN_B);
+            let _ = cr.stroke();
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.9);
+            cr.move_to(px - 12.0, h - Self::MARGIN_B + 14.0);
+            let _ = cr.show_text(&format!("{v:.0}"));
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.35);
+            v += 100.0;
+        }
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.9);
+        cr.move_to(w - Self::MARGIN_R - 22.0, h - 4.0);
+        let _ = cr.show_text("mV");
+        cr.move_to(4.0, Self::MARGIN_T + 2.0);
+        let _ = cr.show_text("MHz");
+        // curves
+        for (i, (c, on)) in curves.iter().zip(enabled).enumerate() {
+            if !on || c.points.is_empty() {
+                continue;
+            }
+            let (cr_r, cr_g, cr_b) = CURVE_COLOURS[i % CURVE_COLOURS.len()];
+            cr.set_source_rgb(cr_r, cr_g, cr_b);
+            cr.set_line_width(1.6);
+            for (k, p) in c.points.iter().enumerate() {
+                let (px, py) = Self::project(f64::from(p.voltage_mv), f64::from(p.freq_mhz), w, h, r);
+                if k == 0 {
+                    cr.move_to(px, py);
+                } else {
+                    cr.line_to(px, py);
+                }
+            }
+            let _ = cr.stroke();
+            // hollow points every few entries: these are not draggable handles
+            for p in c.points.iter().step_by(6) {
+                let (px, py) = Self::project(f64::from(p.voltage_mv), f64::from(p.freq_mhz), w, h, r);
+                cr.arc(px, py, 2.2, 0.0, std::f64::consts::TAU);
+                let _ = cr.stroke();
+            }
+        }
+        if let Some((hx, hy)) = hover
+            && hx >= Self::MARGIN_L
+            && hx <= w - Self::MARGIN_R
+        {
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.6);
+            cr.set_line_width(1.0);
+            cr.move_to(hx, Self::MARGIN_T);
+            cr.line_to(hx, h - Self::MARGIN_B);
+            let _ = cr.stroke();
+            let _ = hy;
+        }
+    }
+
+    /// The point nearest the pointer, ranked on both axes at once (curves
+    /// run within a few MHz of each other, so voltage alone misleads).
+    fn nearest(x: f64, y: f64, w: f64, h: f64, curves: &[NvidiaDomainVfCurve], enabled: &[bool]) -> String {
+        let Some(r) = Self::ranges(curves, enabled) else {
+            return String::new();
+        };
+        let mut best: Option<(f64, String)> = None;
+        for (c, on) in curves.iter().zip(enabled) {
+            if !on {
+                continue;
+            }
+            for p in &c.points {
+                let (px, py) = Self::project(f64::from(p.voltage_mv), f64::from(p.freq_mhz), w, h, r);
+                let d = (px - x).powi(2) + (py - y).powi(2);
+                if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, format!("{}: {} mV → {} MHz", c.domain, p.voltage_mv, p.freq_mhz)));
+                }
+            }
+        }
+        best.map(|(_, s)| s).unwrap_or_default()
+    }
+}
+
 // ------------------------------------------------------------------ the page
 
 pub struct AdvVoltagePage {
@@ -950,6 +1203,7 @@ pub struct AdvVoltagePage {
     tele_msvdd: gtk::Label,
     limits_summary: gtk::Label,
     limits_list: gtk::Label,
+    curves: CurveChart,
     table: Option<NvidiaClocksTable>,
 }
 
@@ -1287,7 +1541,14 @@ impl relm4::Component for AdvVoltagePage {
              • MSVDD voltage rows have no arrow: this object only reports a core result, and those \
              limits act on the fabric rail. P-state style clients carry no frequency at all.\n\
              • Rows marked (floor) are minimums — the lowest clock the boost controller allows, not a \
-             cap — and are excluded from the summary. Low floors mean the card is idle.\n\n\
+             cap — and are excluded from the summary. Low floors mean the card is idle.\n\
+             • \"P-state limit (level N)\" rows carry a P-state level instead of a clock; the level's \
+             meaning is not decoded.\n\
+             • The Blackwell clients NVML has no name for come in two triples (P-state, GPC, XBAR): \
+             \"Power cap controller\" is the board power-limit policy's set, which tracked the power \
+             cap in testing; \"Power policy 2\" is a second policy's set whose XBAR member followed \
+             the MSVDD rail current limit and nothing else. That is all the driver lets us say about \
+             them.\n\n\
              The summary line is the smallest core result among the non-floor clients: a ceiling, so \
              it is meaningful at idle too. While NVML reports an active throttle reason (power cap, \
              thermal…), that reason is shown instead, because the power-cap controller rows are \
@@ -1298,6 +1559,25 @@ impl relm4::Component for AdvVoltagePage {
         limits_box.append(&limits_list);
         let limits_frame = gtk::Frame::builder().child(&limits_box).build();
         content.append(&limits_frame);
+
+        // ---- Clock domain V/F curves, read-only
+        let curves_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let curves_title = section_label("Clock domain V/F curves (read-only)");
+        curves_title.set_hexpand(true);
+        curves_header.append(&curves_title);
+        curves_header.append(&info_icon(
+            "The 127-point voltage/frequency curve of every clock domain that keeps one, as the driver \
+             reports it (RM CLK_VF_POINTS). XBAR, SYS, video and PWRCLK sit on the MSVDD rail; GPC is on \
+             NVVDD and has its own editor on the Overclocking page, so it starts hidden here. The clock and \
+             voltage offsets above shift these curves, which is how their effect can be seen.\n\n\
+             Read-only on purpose: the driver accepts writes to these points but gives no way to verify \
+             they were adopted, and one domain silently drops a written point on the next read. Hover to \
+             read a point; the readout picks the nearest point on both axes.",
+            false,
+        ));
+        content.append(&curves_header);
+        let curves = CurveChart::new();
+        content.append(&curves.frame);
 
         // ---- Tests: the tooling repo's scripts, run from here
         content.append(&section_label("Tests"));
@@ -1337,6 +1617,7 @@ impl relm4::Component for AdvVoltagePage {
             tele_msvdd,
             limits_summary,
             limits_list,
+            curves,
             table: None,
         };
 
@@ -1534,8 +1815,10 @@ impl AdvVoltagePage {
             }
             self.nvvdd_rail.unavailable("No NVIDIA clocks table from the daemon");
             self.msvdd_rail.unavailable("No NVIDIA clocks table from the daemon");
+            self.curves.set(&[]);
             return;
         };
+        self.curves.set(&t.domain_vf_curves);
 
         match t.gpc_xbar_ratio {
             Some(r) => self.ratio.load(
