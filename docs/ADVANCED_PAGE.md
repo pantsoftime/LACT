@@ -291,7 +291,7 @@ Three pieces of [Panchovix's fork](https://github.com/Panchovix/LACT)
   memory without a curve, SYS, video, PWRCLK on GB202). Read-only: the
   driver takes writes to these points but gives no way to check them, and
   one domain drops a written point on the next read. Curves can be toggled
-  in the legend; hover reads the nearest point on both axes.
+  in the legend (all on by default); hover reads the nearest point on both axes.
 
 Also from his measurements: the previously unnamed domains with API bits
 0x80000 and 0x200000 are PWRCLK and the legacy clock, both of which follow

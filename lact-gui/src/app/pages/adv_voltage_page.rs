@@ -1010,9 +1010,9 @@ impl CurveChart {
             while let Some(child) = self.legend.first_child() {
                 self.legend.remove(&child);
             }
-            // GPC has its own editor on the Overclocking page and sits on the
-            // other rail; it starts hidden so the fabric curves set the scale.
-            *self.enabled.borrow_mut() = curves.iter().map(|c| c.domain != "GPCCLK").collect();
+            // Every curve on by default, GPC included: the scale difference is
+            // small and the whole set reads better together (user's call).
+            *self.enabled.borrow_mut() = vec![true; curves.len()];
             for (i, curve) in curves.iter().enumerate() {
                 let check = gtk::CheckButton::builder()
                     .label(format!("{} ({})", curve.domain, curve.rail))
@@ -1576,8 +1576,8 @@ impl relm4::Component for AdvVoltagePage {
         curves_header.append(&info_icon(
             "The 127-point voltage/frequency curve of every clock domain that keeps one, as the driver \
              reports it (RM CLK_VF_POINTS). XBAR, SYS, video and PWRCLK sit on the MSVDD rail; GPC is on \
-             NVVDD and has its own editor on the Overclocking page, so it starts hidden here. The clock and \
-             voltage offsets above shift these curves, which is how their effect can be seen.\n\n\
+             NVVDD and has its own editor on the Overclocking page. The clock and voltage offsets above \
+             shift these curves, which is how their effect can be seen; untick a curve to rescale the rest.\n\n\
              Read-only on purpose: the driver accepts writes to these points but gives no way to verify \
              they were adopted, and one domain silently drops a written point on the next read. Hover to \
              read a point; the readout picks the nearest point on both axes.",
