@@ -100,6 +100,7 @@ async fn listen_exit_signals(handler: Handler) {
     info!("cleaning up and shutting down...");
     async {
         handler.cleanup().await;
+        handler.boot_guard_shutdown();
         socket::cleanup();
     }
     .instrument(debug_span!("shutdown_cleanup"))

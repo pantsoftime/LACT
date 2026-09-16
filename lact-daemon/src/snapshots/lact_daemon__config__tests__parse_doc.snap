@@ -115,3 +115,7 @@ profiles:
       deactivated: echo bar >> /tmp/log
 current_profile: vkcube
 auto_switch_profiles: true
+boot_guard:
+  enabled: false
+  fallback: ~
+  force_next_boot: false

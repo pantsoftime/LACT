@@ -17,6 +17,9 @@ pub enum AppMsg {
     ReloadApiInfo,
     Stats(Arc<DeviceStats>),
     ProfilesPolled(Arc<ProfilesInfo>),
+    /// Boot guard (this fork): polled with the stats
+    BootGuardPolled(Arc<lact_schema::boot_guard::BootGuardStatus>),
+    BootGuardResume,
     ApplyChanges,
     RevertChanges,
     SettingsChanged,

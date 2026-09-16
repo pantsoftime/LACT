@@ -45,6 +45,7 @@ use lact_client::{ConnectionStatusMsg, DaemonClient};
 use lact_schema::{
     DeviceApiInfo, DeviceFlag, DeviceListEntry, DeviceStats, DeviceType, SystemInfo,
     args::GuiArgs,
+    boot_guard::BootGuardStatus,
     config::{GpuConfig, Profile},
     request::{ConfirmCommand, ProfileBase, SetClocksCommand},
 };
@@ -112,6 +113,8 @@ pub struct AppModel {
 
     ui_sensitive: BoolBinding,
     is_reconnecting: BoolBinding,
+    /// Boot guard (this fork): last polled status, for the banner
+    boot_guard: Option<Arc<BootGuardStatus>>,
 
     info_page: relm4::Controller<InformationPage>,
     oc_page: relm4::Controller<OcPage>,
@@ -284,6 +287,16 @@ impl AsyncComponent for AppModel {
                                     add_binding: (&model.is_reconnecting, "revealed"),
                                 },
 
+                                // Boot guard (this fork): shown until the trip is resumed or acknowledged
+                                add_top_bar = &adw::Banner {
+                                    #[watch]
+                                    set_revealed: model.boot_guard.as_ref().is_some_and(|s| s.engaged.as_ref().is_some_and(|t| !t.acknowledged)),
+                                    #[watch]
+                                    set_title: &boot_guard_banner_title(model.boot_guard.as_deref()),
+                                    set_button_label: Some("Resume saved profile"),
+                                    connect_button_clicked => AppMsg::BootGuardResume,
+                                },
+
                                 #[wrap(Some)]
                                 set_content = &gtk::ScrolledWindow {
                                     set_hscrollbar_policy: gtk::PolicyType::Never,
@@ -429,7 +442,9 @@ impl AsyncComponent for AppModel {
         let oc_page =
             OcPage::launch(settings_changed.clone()).forward(sender.input_sender(), |msg| msg);
         let adv_voltage_page =
-            AdvVoltagePage::launch_default().forward(sender.input_sender(), |msg| msg);
+            AdvVoltagePage::builder()
+                .launch(daemon_client.clone())
+                .forward(sender.input_sender(), |msg| msg);
         let wireview_page = WireViewPage::builder().launch(daemon_client.clone()).detach();
         let thermals_page = ThermalsPage::detach_default();
 
@@ -509,6 +524,7 @@ impl AsyncComponent for AppModel {
             service_setup_dialog: None,
             ui_sensitive: BoolBinding::new(false),
             is_reconnecting: BoolBinding::new(false),
+            boot_guard: None,
             stats_task_handle: None,
             settings_changed,
             system_info,
@@ -620,7 +636,25 @@ impl AppModel {
                 self.reload_profiles(state_sender).await?;
                 sender.input(AppMsg::ReloadData { full: false });
             }
+            AppMsg::BootGuardPolled(status) => {
+                if self.boot_guard.as_deref() != Some(status.as_ref()) {
+                    self.adv_voltage_page
+                        .emit(AdvVoltagePageMsg::BootGuard(status.clone()));
+                    self.boot_guard = Some(status);
+                }
+            }
+            AppMsg::BootGuardResume => {
+                let client = self.daemon_client.clone();
+                relm4::spawn_local(async move {
+                    if let Err(err) = client.boot_guard_resume().await {
+                        APP_BROKER.send(AppMsg::Error(Arc::new(err)));
+                    }
+                });
+            }
             AppMsg::ProfilesPolled(profiles) => {
+                self.adv_voltage_page.emit(AdvVoltagePageMsg::Profiles(
+                    profiles.profiles.keys().cloned().collect(),
+                ));
                 let profiles_changed = self
                     .profile_selector
                     .model()
@@ -1472,8 +1506,38 @@ fn start_stats_update_loop(
                     error!("could not fetch profile info: {err:#}");
                 }
             }
+
+            match daemon_client.boot_guard_status().await {
+                Ok(status) => sender.input(AppMsg::BootGuardPolled(Arc::new(status))),
+                Err(err) => error!("could not fetch boot guard status: {err:#}"),
+            }
         }
     })
+}
+
+/// One line for the top banner while the boot guard is engaged.
+fn boot_guard_banner_title(status: Option<&BootGuardStatus>) -> String {
+    let Some(trip) = status.and_then(|s| s.engaged.as_ref()) else {
+        return String::new();
+    };
+    let cause = if trip.forced {
+        "the one-shot fallback flag was set".to_owned()
+    } else {
+        format!(
+            "the {} while profile '{}' was active",
+            if trip.same_boot {
+                "LACT daemon died"
+            } else {
+                "system stopped uncleanly"
+            },
+            trip.profile.as_deref().unwrap_or("default")
+        )
+    };
+    let running = trip
+        .applied_fallback
+        .as_deref()
+        .map_or("stock settings".to_owned(), |p| format!("fallback profile '{p}'"));
+    format!("Boot guard engaged: {cause}. The GPU is running {running}.")
 }
 
 async fn create_connection(

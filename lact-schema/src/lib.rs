@@ -1,5 +1,6 @@
 #[cfg(feature = "args")]
 pub mod args;
+pub mod boot_guard;
 pub mod config;
 pub mod i18n;
 mod profiles;
@@ -483,6 +484,9 @@ pub struct ClocksInfo {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
+// The NVIDIA table grew with this fork's RM records; it is built once per
+// fetch, so the size gap is not worth boxing every access site for.
+#[allow(clippy::large_enum_variant)]
 pub enum ClocksTable {
     Amd(AmdClocksTableGen),
     Nvidia(NvidiaClocksTable),

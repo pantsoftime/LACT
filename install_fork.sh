@@ -20,6 +20,19 @@ done
 echo "== make install (PREFIX=/usr/local) =="
 make install PREFIX=/usr/local
 
+echo "== boot guard login notice (profile.d / fish) =="
+install -m 644 res/boot-guard/lact-boot-guard.sh /etc/profile.d/lact-boot-guard.sh
+if [ -d /etc/fish ]; then
+    install -d /etc/fish/conf.d
+    install -m 644 res/boot-guard/lact-boot-guard.fish /etc/fish/conf.d/lact-boot-guard.fish
+fi
+# zsh in a desktop terminal is neither a login shell nor reads profile.d;
+# source the snippet from the system zshrc once.
+install -d /etc/zsh
+if ! grep -qs lact-boot-guard /etc/zsh/zshrc; then
+    printf '\n# LACT boot guard notice\n[ -r /etc/profile.d/lact-boot-guard.sh ] && . /etc/profile.d/lact-boot-guard.sh\n' >> /etc/zsh/zshrc
+fi
+
 echo "== enabling service =="
 systemctl daemon-reload
 systemctl enable --now lactd

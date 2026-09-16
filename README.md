@@ -47,6 +47,7 @@ system.
   - GPU undervolting (via voltage offset on AMD, VF curve on Nvidia)
 - #### Settings profiles
   - Automatic profile activation based on running processes or gamemode status
+  - Boot guard (this fork): after a crash or hang the saved profile is not re-applied at boot; a fallback (stock by default) is, with a banner in the GUI and a login notice in the terminal until you resume
 - #### [OpenTelemetry metrics exporter](./docs/EXPORTER.md)
 
 GPU configuration is handled by a system service that does not depend on a graphical session (Wayland/X11).
@@ -64,6 +65,16 @@ the ones only this page reaches.
 | Telemetry, clock and voltage cards, rail limits | Memory, power and current limits, boost limits, V/F curves, tests |
 | --- | --- |
 | ![Advanced page: telemetry tiles including the rail currents, the core and fabric cards and the two rail-limit cards](./res/screenshots/advanced-1.png) | ![Advanced page: memory, power-limit and OCP cards, the boost-limit panel, the clock domain V/F curves and the test runner](./res/screenshots/advanced-2.png) |
+
+The **Boot guard** row at the top of the page is the safety net for the rest
+of it: with it on, the daemon writes a marker before applying settings and
+clears it on a clean shutdown. A marker still present at the next start means
+the system crashed, hung or lost power with that profile active, so the
+daemon applies the fallback instead (stock, or a profile you pick), leaves
+automatic switching off, shows a banner in the GUI and drops a notice into
+`/run/motd.d` that the terminal prints at login until you click *Resume*.
+"Fallback at next start" is a one-shot for trying settings you already
+distrust. Details in [docs/ADVANCED_PAGE.md](./docs/ADVANCED_PAGE.md#boot-guard-2026-09-15).
 
 ## What the page controls
 

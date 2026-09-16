@@ -3,6 +3,7 @@ use anyhow::Context;
 use indexmap::IndexMap;
 use lact_schema::{
     ClocksInfo, ClocksTable, NvidiaVfPoint,
+    boot_guard::BootGuardConfig,
     config::{CurvePoint, GpuConfig, NvidiaCurvePoint, Profile, ProfileHooks},
 };
 use nix::unistd::{Group, getuid};
@@ -42,6 +43,9 @@ pub struct Config {
     pub current_profile: Option<Rc<str>>,
     #[serde(default)]
     pub auto_switch_profiles: bool,
+    /// Boot guard (this fork): fallback after an unclean stop.
+    #[serde(default)]
+    pub boot_guard: BootGuardConfig,
 }
 
 impl Default for Config {
@@ -53,6 +57,7 @@ impl Default for Config {
             profiles: IndexMap::new(),
             current_profile: None,
             auto_switch_profiles: false,
+            boot_guard: BootGuardConfig::default(),
             version: 7,
         }
     }
@@ -327,6 +332,22 @@ impl Config {
         self.gpus.clear();
         self.profiles.clear();
         self.current_profile = None;
+    }
+
+    /// The configuration the boot guard applies when engaged: the named
+    /// fallback profile, or — when `fallback` is `None` or names a profile
+    /// that no longer exists — stock, i.e. no GPU settings at all.
+    /// Returns the config and the fallback it actually selected.
+    pub fn with_fallback(&self, fallback: Option<&str>) -> (Config, Option<String>) {
+        let mut config = self.clone();
+        if let Some(name) = fallback.filter(|name| self.profiles.contains_key(*name)) {
+            config.current_profile = Some(Rc::from(name));
+            (config, Some(name.to_owned()))
+        } else {
+            config.gpus.clear();
+            config.current_profile = None;
+            (config, None)
+        }
     }
 }
 
@@ -626,6 +647,7 @@ mod tests {
             version: 0,
             daemon: Daemon::default(),
             apply_settings_timer: 5,
+            boot_guard: lact_schema::boot_guard::BootGuardConfig::default(),
             gpus: IndexMap::from([
                 (
                     "10DE:2704-1462:5110-0000:09:00.0".to_owned(),

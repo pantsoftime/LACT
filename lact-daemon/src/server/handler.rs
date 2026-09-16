@@ -5,6 +5,8 @@ use super::{
 };
 #[cfg(feature = "display-info")]
 use crate::server::display;
+use crate::server::boot_guard::{BootGuardStore, Startup};
+use lact_schema::boot_guard::{BootGuardConfig, BootGuardStatus, BootGuardTrip};
 use crate::system::run_command;
 use crate::{
     bindings::intel::IntelDrm,
@@ -118,6 +120,11 @@ pub struct Handler {
     reload_tx: Rc<mpsc::Sender<Duration>>,
     /// Thermal Grizzly WireView Pro II (this fork); the port is opened on demand
     pub wireview: super::wireview::WireViewManager,
+    /// Boot guard (this fork): on-disk marker store, the current trip, and
+    /// the last store error (the guard is inert while one is set).
+    boot_guard_store: Rc<BootGuardStore>,
+    boot_guard_trip: Rc<RefCell<Option<BootGuardTrip>>>,
+    boot_guard_error: Rc<RefCell<Option<String>>>,
 }
 
 impl<'a> Handler {
@@ -219,6 +226,9 @@ impl<'a> Handler {
             ignored_gpu_ids: Rc::new(RwLock::new(Vec::new())),
             reload_tx: Rc::new(reload_tx),
             wireview: super::wireview::WireViewManager::new(),
+            boot_guard_store: Rc::new(BootGuardStore::default()),
+            boot_guard_trip: Rc::new(RefCell::new(None)),
+            boot_guard_error: Rc::new(RefCell::new(None)),
         };
         {
             // Release the WireView port when the GUI stops looking at it.
@@ -231,6 +241,8 @@ impl<'a> Handler {
             });
         }
 
+        let engaged = handler.boot_guard_startup().await;
+
         if let Err(err) = handler.apply_current_config().await {
             error!("could not apply config: {err:#}");
         }
@@ -239,7 +251,7 @@ impl<'a> Handler {
             info!("using profile '{profile_name}'");
         }
 
-        if handler.config.read().await.auto_switch_profiles {
+        if handler.config.read().await.auto_switch_profiles && !engaged {
             handler.start_profile_watcher().await;
         }
 
@@ -259,7 +271,155 @@ impl<'a> Handler {
     pub async fn apply_current_config(&self) -> anyhow::Result<()> {
         let config = self.config.read().await;
         let controllers = self.gpu_controllers.read().await;
+        let config = self.boot_guard_effective_config(&config);
         apply_config_to_controllers(&controllers, &config).await
+    }
+
+    // ---- Boot guard (this fork) --------------------------------------------
+
+    /// Decide at startup whether to engage. Returns whether the guard is
+    /// engaged afterwards; while engaged the saved profile is not applied and
+    /// the profile watcher is not started.
+    async fn boot_guard_startup(&self) -> bool {
+        let (force, fallback) = {
+            let config = self.config.read().await;
+            (config.boot_guard.force_next_boot, config.boot_guard.fallback.clone())
+        };
+        let startup = match self.boot_guard_store.startup(force) {
+            Ok(startup) => startup,
+            Err(err) => {
+                error!("boot guard state unreadable, guard disabled: {err:#}");
+                *self.boot_guard_error.borrow_mut() = Some(format!("{err:#}"));
+                return false;
+            }
+        };
+        if force {
+            // One-shot: consumed whether or not it tripped.
+            let mut config = self.config.write().await;
+            config.boot_guard.force_next_boot = false;
+            if let Err(err) = config.save(&self.config_last_saved) {
+                error!("could not clear the boot-guard one-shot flag: {err:#}");
+            }
+        }
+        let trip = match startup {
+            Startup::Normal => return false,
+            Startup::StillEngaged(trip) => trip,
+            Startup::Engage(mut trip) => {
+                let (_, selected) = self.config.read().await.with_fallback(fallback.as_deref());
+                if fallback.is_some() && selected.is_none() {
+                    warn!("boot guard fallback profile {fallback:?} does not exist; using stock");
+                }
+                trip.applied_fallback = selected;
+                if let Err(err) = self.boot_guard_store.engage(&trip) {
+                    error!("could not record the boot guard trip: {err:#}");
+                    *self.boot_guard_error.borrow_mut() = Some(format!("{err:#}"));
+                }
+                trip
+            }
+        };
+        super::boot_guard::log_trip(&trip);
+        if trip.applied_fallback.is_none() {
+            // Stock: make sure nothing is left over from a same-boot restart.
+            self.cleanup().await;
+        }
+        *self.boot_guard_trip.borrow_mut() = Some(trip);
+        true
+    }
+
+    /// While engaged, the fallback configuration replaces the saved one;
+    /// otherwise the marker is armed (when enabled) before the saved
+    /// configuration is handed back for applying.
+    fn boot_guard_effective_config(&self, config: &Config) -> Config {
+        if let Some(trip) = self.boot_guard_trip.borrow().as_ref() {
+            return config.with_fallback(trip.applied_fallback.as_deref()).0;
+        }
+        self.boot_guard_arm(config);
+        config.clone()
+    }
+
+    fn boot_guard_arm(&self, config: &Config) {
+        if self.boot_guard_error.borrow().is_some() {
+            return;
+        }
+        let result = if config.boot_guard.enabled {
+            self.boot_guard_store.arm(config.current_profile.as_deref())
+        } else {
+            self.boot_guard_store.disarm()
+        };
+        if let Err(err) = result {
+            error!("boot guard marker error, guard disabled: {err:#}");
+            *self.boot_guard_error.borrow_mut() = Some(format!("{err:#}"));
+        }
+    }
+
+    /// Clean shutdown: nothing will be applied until the next start.
+    pub fn boot_guard_shutdown(&self) {
+        if let Err(err) = self.boot_guard_store.disarm() {
+            error!("could not clear the boot guard marker: {err:#}");
+        }
+    }
+
+    /// An explicit user action supersedes an engaged guard: forget the trip
+    /// so the action applies what it says (the caller re-applies and re-arms).
+    fn boot_guard_leave(&self) {
+        if self.boot_guard_trip.borrow_mut().take().is_some() {
+            info!("boot guard: user resumed, leaving the fallback");
+            if let Err(err) = self.boot_guard_store.clear() {
+                error!("could not clear the boot guard trip record: {err:#}");
+            }
+        }
+    }
+
+    pub async fn boot_guard_status(&self) -> BootGuardStatus {
+        BootGuardStatus {
+            config: self.config.read().await.boot_guard.clone(),
+            armed: self.boot_guard_store.is_armed(),
+            engaged: self.boot_guard_trip.borrow().clone(),
+            error: self.boot_guard_error.borrow().clone(),
+        }
+    }
+
+    pub async fn set_boot_guard(&self, new: BootGuardConfig) -> anyhow::Result<BootGuardStatus> {
+        if let Some(name) = &new.fallback {
+            self.config.read().await.profile(name)?;
+        }
+        {
+            let mut config = self.config.write().await;
+            config.boot_guard = new;
+            config.save(&self.config_last_saved)?;
+        }
+        if self.boot_guard_trip.borrow().is_none() {
+            // Re-arm (or disarm) to match the new setting right away.
+            let config = self.config.read().await;
+            self.boot_guard_arm(&config);
+        }
+        Ok(self.boot_guard_status().await)
+    }
+
+    /// Leave the fallback: apply the saved profile again and restart
+    /// automatic switching if it was on.
+    pub async fn boot_guard_resume(&self) -> anyhow::Result<BootGuardStatus> {
+        if self.boot_guard_trip.borrow().is_none() {
+            bail!("The boot guard is not engaged");
+        }
+        self.boot_guard_leave();
+        self.apply_current_config().await?;
+        if self.config.read().await.auto_switch_profiles {
+            self.start_profile_watcher().await;
+        }
+        Ok(self.boot_guard_status().await)
+    }
+
+    /// Keep the fallback until the next boot, but drop the login notice.
+    pub async fn boot_guard_acknowledge(&self) -> anyhow::Result<BootGuardStatus> {
+        let trip = {
+            let mut guard = self.boot_guard_trip.borrow_mut();
+            let trip = guard.as_mut().context("The boot guard is not engaged")?;
+            trip.acknowledged = true;
+            trip.clone()
+        };
+        self.boot_guard_store.acknowledge(&trip)?;
+        Ok(self.boot_guard_status().await)
     }
 
     pub async fn notify_reload_gpus(&self, accum_interval: Duration) {
@@ -287,6 +447,7 @@ impl<'a> Handler {
 
                 *controllers_guard = new_controllers;
 
+                let config = self.boot_guard_effective_config(&config);
                 match apply_config_to_controllers(&controllers_guard, &config).await {
                     Ok(()) => {
                         info!("configuration applied");
@@ -338,8 +499,10 @@ impl<'a> Handler {
             ));
         }
 
+        self.boot_guard_leave();
         let (previous_config, apply_timer) = {
             let config = self.config.read().await;
+            self.boot_guard_arm(&config);
             let apply_timer = config.apply_settings_timer;
             let gpu_config = config.gpus()?.get(&id).cloned().unwrap_or_default();
             (gpu_config, apply_timer)
@@ -915,6 +1078,7 @@ impl<'a> Handler {
         if !self.profile_holds.borrow().is_empty() {
             bail!("Cannot change profile while a hold is active");
         }
+        self.boot_guard_leave();
         if auto_switch {
             self.start_profile_watcher().await;
         } else {
@@ -1258,6 +1422,8 @@ impl<'a> Handler {
 
     pub async fn reset_config(&self) {
         self.cleanup().await;
+        self.boot_guard_leave();
+        self.boot_guard_shutdown();
 
         let mut config = self.config.write().await;
         config.clear();

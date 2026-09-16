@@ -296,3 +296,66 @@ Three pieces of [Panchovix's fork](https://github.com/Panchovix/LACT)
 Also from his measurements: the previously unnamed domains with API bits
 0x80000 and 0x200000 are PWRCLK and the legacy clock, both of which follow
 XBAR through the propagation ratio; they are named in the domain table now.
+
+## Boot guard (2026-09-15)
+
+A tuned profile that hangs the machine is re-applied by the daemon at the
+next boot, and with automatic switching on it comes back the moment the
+game launches again. The boot guard breaks that loop the way Afterburner's
+safe mode does on Windows, with a dirty flag on disk.
+
+**Mechanism.** With the guard enabled the daemon writes
+`/var/lib/lact/boot_guard/armed.json` (profile name, kernel boot id,
+timestamp; written to a temp file, fsynced, renamed, directory fsynced)
+*before* it applies settings — at startup, on a profile switch, on a config
+reload, and on a manual Apply — and removes it on a clean shutdown (SIGTERM
+from systemd) or a config reset. At startup a marker that is still there
+means the previous session never shut down cleanly. The daemon then
+*engages*: it records the trip in `engaged.json`, removes the marker, and
+applies the **fallback** instead of the saved profile. The fallback is
+*stock* by default — nothing is applied and, because a marker from the same
+kernel boot means only the daemon died, the controllers are reset first so
+nothing survives from before — or a named profile. Automatic profile
+switching is not started while engaged, so a process rule cannot re-apply
+the suspect profile. The trip survives daemon restarts until it is resolved.
+
+**Resolving it.** The GUI shows a banner ("Boot guard engaged: the system
+stopped uncleanly while profile 'bench' was active. The GPU is running stock
+settings.") with a *Resume saved profile* button, and the Boot guard row on
+this page has the same plus *Keep fallback until reboot*. Resume applies the
+saved profile again (and re-arms), and restarts automatic switching if it
+was on. Keep clears the notice but leaves the fallback in place; the next
+boot is a normal one because nothing was armed. Any explicit action that
+applies settings — switching a profile, applying from either page, a config
+reset — also counts as resuming, since the user is taking over; passive
+re-applies (a config-file reload, a GPU reload after suspend) keep the
+fallback.
+
+**Controls.** *Enabled* arms the marker; *Fallback* picks stock or a
+profile; *Fallback at next start* is a one-shot that engages at the next
+daemon start whether or not anything crashed (cleared once used), for
+settings you already distrust. The status line says whether the marker is
+on disk. If the state directory cannot be written the row says so and the
+guard is inert rather than pretending.
+
+**Login notice.** While engaged and unacknowledged the daemon keeps
+`/run/motd.d/lact-boot-guard`, which `pam_motd` shows on tty and SSH logins.
+Terminals opened from the desktop do not go through `pam_motd`, so
+`install_fork.sh` also installs `res/boot-guard/lact-boot-guard.sh` into
+`/etc/profile.d/`, the fish variant into `/etc/fish/conf.d/`, and sources
+the sh snippet from `/etc/zsh/zshrc`; each prints the file in interactive
+shells only. Resume or Keep removes it.
+
+**What trips it that is not a GPU crash.** Any unclean stop: a power cut,
+an unrelated kernel panic, holding the power button. That is accepted as
+the conservative side; recovery is one click. A check of the previous
+boot's kernel log for an Xid was left out on purpose — a hard hang often
+logs nothing, so it could only make the guard less sensitive.
+
+**Testing.** `sudo systemctl kill -s KILL lactd` exercises the same-boot
+path (systemd restarts the daemon, which finds its own marker); a real
+unclean shutdown — `echo c | sudo tee /proc/sysrq-trigger` with everything
+saved — exercises the reboot path. A normal reboot must *not* trip it; that
+is the case to check first. Unit tests cover the marker lifecycle,
+the one-shot, a corrupt marker (an error, not a silent pass) and the config
+round-trip.

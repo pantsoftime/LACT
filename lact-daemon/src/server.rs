@@ -3,6 +3,7 @@ mod display;
 pub mod gpu_controller;
 pub mod handler;
 pub mod wireview;
+pub mod boot_guard;
 mod metrics;
 mod opencl;
 mod profiles;
@@ -267,6 +268,10 @@ async fn handle_request<'a>(
         Request::DisableOverdrive => ok_response(system::disable_overdrive().await?),
         Request::GenerateSnapshot => ok_response(handler.generate_snapshot().await?),
         Request::WireViewInfo => ok_response(handler.wireview.info().await?),
+        Request::BootGuardStatus => ok_response(handler.boot_guard_status().await),
+        Request::SetBootGuard { config } => ok_response(handler.set_boot_guard(config).await?),
+        Request::BootGuardResume => ok_response(handler.boot_guard_resume().await?),
+        Request::BootGuardAcknowledge => ok_response(handler.boot_guard_acknowledge().await?),
         Request::WireViewStatus => ok_response(handler.wireview.status().await?),
         Request::WireViewSetConfig {
             config,

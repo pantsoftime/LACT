@@ -20,6 +20,8 @@ use crate::app::graphs_window::stat::StatType;
 use crate::app::msg::AppMsg;
 use crate::app::pages::PageUpdate;
 use gtk::prelude::*;
+use lact_client::DaemonClient;
+use lact_schema::boot_guard::{BootGuardConfig, BootGuardStatus};
 use lact_schema::config::GpuConfig;
 use lact_schema::request::{ClockspeedType, SetClocksCommand};
 use lact_schema::{
@@ -53,6 +55,10 @@ pub enum AdvVoltagePageMsg {
         initial: bool,
     },
     ClocksTable(Option<ClocksTable>),
+    /// Boot guard status, forwarded from the app's poll when it changes
+    BootGuard(Arc<BootGuardStatus>),
+    /// Profile names for the fallback picker
+    Profiles(Vec<String>),
 }
 
 /// What an editable card writes into the pending config on Apply.
@@ -743,6 +749,260 @@ impl TestRunner {
 
 // ------------------------------------------------------------ widget helpers
 
+/// Boot guard controls (this fork): the arm switch, the fallback picker, the
+/// one-shot flag, and the trip notice with Resume / Keep. The daemon owns
+/// the state; every change is sent at once and the row re-renders from the
+/// daemon's answer, so what is shown is always what the daemon has.
+struct BootGuardPanel {
+    frame: gtk::Frame,
+    state: Rc<BootGuardState>,
+}
+
+struct BootGuardState {
+    client: DaemonClient,
+    enabled: gtk::Switch,
+    fallback: gtk::DropDown,
+    force: gtk::CheckButton,
+    status: gtk::Label,
+    resume: gtk::Button,
+    keep: gtk::Button,
+    profiles: RefCell<Vec<String>>,
+    last: RefCell<Option<Arc<BootGuardStatus>>>,
+    /// Suppresses the change handlers while widgets are set from a status.
+    loading: Cell<bool>,
+}
+
+const STOCK_LABEL: &str = "Stock (nothing applied)";
+
+impl BootGuardPanel {
+    fn new(client: DaemonClient) -> Self {
+        let enabled = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .tooltip_text(
+                "On: a marker is written before settings are applied and removed on a clean shutdown. \
+                 If the marker is still there at the next start, the saved profile is NOT applied; \
+                 the fallback below is, and automatic switching stays off until you resume.",
+            )
+            .build();
+        let fallback = gtk::DropDown::from_strings(&[STOCK_LABEL]);
+        fallback.set_tooltip_text(Some(
+            "What to run after an unclean stop. Stock applies nothing at all; a profile applies that profile's settings.",
+        ));
+        let force = gtk::CheckButton::builder()
+            .label("Fallback at next start")
+            .tooltip_text(
+                "One-shot: engage at the next daemon start whether or not anything crashed. \
+                 Cleared automatically once used. For trying settings you already distrust.",
+            )
+            .build();
+        let status = caption("—", false);
+        status.set_hexpand(true);
+        status.set_width_chars(-1);
+        status.set_max_width_chars(-1);
+        let resume = gtk::Button::builder()
+            .label("Resume saved profile")
+            .css_classes(["suggested-action"])
+            .tooltip_text("Apply the saved profile again and restart automatic switching if it was on")
+            .visible(false)
+            .build();
+        let keep = gtk::Button::builder()
+            .label("Keep fallback until reboot")
+            .tooltip_text("Stay as is and clear the notice; the saved profile applies again at the next boot")
+            .visible(false)
+            .build();
+
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        controls.append(&heading("Boot guard"));
+        controls.append(&info_icon(
+            "Protects against a tuned profile being re-applied at boot after it hung or crashed the system. \
+             A login notice is also written to /run/motd.d while engaged.",
+            false,
+        ));
+        controls.append(&enabled);
+        controls.append(&gtk::Label::new(Some("Fallback")));
+        controls.append(&fallback);
+        controls.append(&force);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.append(&status);
+        actions.append(&keep);
+        actions.append(&resume);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        column.set_margin_all(10);
+        column.append(&controls);
+        column.append(&actions);
+        let frame = gtk::Frame::builder().child(&column).css_classes(["card"]).build();
+
+        let state = Rc::new(BootGuardState {
+            client,
+            enabled,
+            fallback,
+            force,
+            status,
+            resume,
+            keep,
+            profiles: RefCell::new(Vec::new()),
+            last: RefCell::new(None),
+            loading: Cell::new(false),
+        });
+        {
+            let s = state.clone();
+            state.enabled.connect_active_notify(move |_| s.push());
+        }
+        {
+            let s = state.clone();
+            state.fallback.connect_selected_notify(move |_| s.push());
+        }
+        {
+            let s = state.clone();
+            state.force.connect_toggled(move |_| s.push());
+        }
+        {
+            let s = state.clone();
+            state.resume.connect_clicked(move |_| {
+                let s = s.clone();
+                relm4::spawn_local(async move {
+                    let result = s.client.boot_guard_resume().await;
+                    s.answer(result);
+                });
+            });
+        }
+        {
+            let s = state.clone();
+            state.keep.connect_clicked(move |_| {
+                let s = s.clone();
+                relm4::spawn_local(async move {
+                    let result = s.client.boot_guard_acknowledge().await;
+                    s.answer(result);
+                });
+            });
+        }
+        Self { frame, state }
+    }
+}
+
+impl BootGuardState {
+    /// Send the widgets' current values to the daemon.
+    fn push(self: &Rc<Self>) {
+        if self.loading.get() {
+            return;
+        }
+        let selected = self.fallback.selected() as usize;
+        let config = BootGuardConfig {
+            enabled: self.enabled.is_active(),
+            fallback: (selected > 0)
+                .then(|| self.profiles.borrow().get(selected - 1).cloned())
+                .flatten(),
+            force_next_boot: self.force.is_active(),
+        };
+        let s = self.clone();
+        relm4::spawn_local(async move {
+            let result = s.client.set_boot_guard(config).await;
+            s.answer(result);
+        });
+    }
+
+    fn answer(&self, result: anyhow::Result<BootGuardStatus>) {
+        match result {
+            Ok(status) => self.show(&Arc::new(status)),
+            Err(err) => {
+                self.status.set_label(&format!("Boot guard: {err:#}"));
+                self.status.set_css_classes(&["caption", "warning"]);
+            }
+        }
+    }
+
+    /// The profile names, in the daemon's order, for the fallback picker.
+    fn set_profiles(&self, names: Vec<String>) {
+        if *self.profiles.borrow() == names {
+            return;
+        }
+        let mut items: Vec<&str> = vec![STOCK_LABEL];
+        items.extend(names.iter().map(String::as_str));
+        self.loading.set(true);
+        self.fallback.set_model(Some(&gtk::StringList::new(&items)));
+        self.loading.set(false);
+        *self.profiles.borrow_mut() = names;
+        if let Some(last) = self.last.borrow().clone() {
+            self.show(&last);
+        }
+    }
+
+    fn show(&self, status: &Arc<BootGuardStatus>) {
+        *self.last.borrow_mut() = Some(status.clone());
+        let cfg = &status.config;
+        self.loading.set(true);
+        self.enabled.set_active(cfg.enabled);
+        self.force.set_active(cfg.force_next_boot);
+        let position = cfg
+            .fallback
+            .as_ref()
+            .and_then(|name| self.profiles.borrow().iter().position(|p| p == name))
+            .map_or(0, |i| i as u32 + 1);
+        self.fallback.set_selected(position);
+        self.loading.set(false);
+
+        let usable = status.error.is_none();
+        for w in [
+            self.enabled.upcast_ref::<gtk::Widget>(),
+            self.fallback.upcast_ref(),
+            self.force.upcast_ref(),
+        ] {
+            w.set_sensitive(usable);
+        }
+
+        let (text, warning) = boot_guard_text(status);
+        self.status.set_label(&text);
+        self.status
+            .set_css_classes(if warning { &["caption", "warning"] } else { &["caption", "dim-label"] });
+        let engaged = status.engaged.as_ref();
+        self.resume.set_visible(engaged.is_some());
+        self.keep.set_visible(engaged.is_some_and(|t| !t.acknowledged));
+    }
+}
+
+/// The status line under the boot guard controls.
+fn boot_guard_text(status: &BootGuardStatus) -> (String, bool) {
+    if let Some(err) = &status.error {
+        return (format!("Guard unavailable: {err}"), true);
+    }
+    if let Some(trip) = &status.engaged {
+        let cause = if trip.forced {
+            "the one-shot flag was set".to_owned()
+        } else {
+            format!(
+                "the {} while profile '{}' was active",
+                if trip.same_boot {
+                    "daemon died"
+                } else {
+                    "system stopped uncleanly"
+                },
+                trip.profile.as_deref().unwrap_or("default")
+            )
+        };
+        let running = trip
+            .applied_fallback
+            .as_deref()
+            .map_or("stock settings".to_owned(), |p| format!("fallback profile '{p}'"));
+        let tail = if trip.acknowledged {
+            " Kept until the next boot."
+        } else {
+            ""
+        };
+        return (format!("ENGAGED: {cause}. Running {running}.{tail}"), true);
+    }
+    let mut text = if !status.config.enabled {
+        "Off: a crashed profile is re-applied at the next boot.".to_owned()
+    } else if status.armed {
+        "Armed: an unclean stop from here engages the fallback at the next start.".to_owned()
+    } else {
+        "Enabled; the marker is written when settings are next applied.".to_owned()
+    };
+    if status.config.force_next_boot {
+        text.push_str(" One-shot set: the fallback engages at the next daemon start.");
+    }
+    (text, false)
+}
+
 fn heading(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
@@ -1175,6 +1435,7 @@ impl CurveChart {
 pub struct AdvVoltagePage {
     content: gtk::Box,
     status_label: gtk::Label,
+    boot_guard: BootGuardPanel,
 
     tele_gpc: gtk::Label,
     tele_xbar: gtk::Label,
@@ -1217,7 +1478,7 @@ pub struct AdvVoltagePage {
 
 #[relm4::component(pub)]
 impl relm4::Component for AdvVoltagePage {
-    type Init = ();
+    type Init = DaemonClient;
     type Input = AdvVoltagePageMsg;
     type Output = AppMsg;
     type CommandOutput = ();
@@ -1232,7 +1493,7 @@ impl relm4::Component for AdvVoltagePage {
     }
 
     fn init(
-        _: Self::Init,
+        client: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
@@ -1248,6 +1509,10 @@ impl relm4::Component for AdvVoltagePage {
             .css_classes(["warning"])
             .build();
         content.append(&status_label);
+
+        // ---- boot guard: the fallback switch, above everything it protects
+        let boot_guard = BootGuardPanel::new(client);
+        content.append(&boot_guard.frame);
 
         // ---- live telemetry row: a flow box, so extra tiles wrap on a
         // narrow window instead of squeezing the row; homogeneous keeps the
@@ -1595,6 +1860,7 @@ impl relm4::Component for AdvVoltagePage {
         let model = Self {
             content,
             status_label,
+            boot_guard,
             tele_gpc,
             tele_xbar,
             tele_sys,
@@ -1648,6 +1914,8 @@ impl relm4::Component for AdvVoltagePage {
                 self.show_table(table.as_ref());
                 self.table = table;
             }
+            AdvVoltagePageMsg::BootGuard(status) => self.boot_guard.state.show(&status),
+            AdvVoltagePageMsg::Profiles(names) => self.boot_guard.state.set_profiles(names),
         }
     }
 }

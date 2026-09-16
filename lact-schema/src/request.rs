@@ -128,6 +128,15 @@ pub enum Request<'a> {
     DisableOverdrive,
     GenerateSnapshot,
     /// Thermal Grizzly WireView Pro II (this fork): `None` when no device is plugged in
+    /// Boot guard (this fork)
+    BootGuardStatus,
+    SetBootGuard {
+        config: crate::boot_guard::BootGuardConfig,
+    },
+    /// Resume the saved profile (and auto-switching) after the guard engaged.
+    BootGuardResume,
+    /// Keep the fallback until the next boot, but clear the notice.
+    BootGuardAcknowledge,
     WireViewInfo,
     WireViewStatus,
     WireViewSetConfig {

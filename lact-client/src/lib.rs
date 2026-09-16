@@ -4,7 +4,8 @@ mod macros;
 
 pub use lact_schema as schema;
 use lact_schema::{
-    DeviceApiInfo, DisplaysInfo, Pong, ProcessList, ProfileRule,
+    DeviceApiInfo,
+    boot_guard::{BootGuardConfig, BootGuardStatus}, DisplaysInfo, Pong, ProcessList, ProfileRule,
     config::{GpuConfig, Profile, ProfileHooks},
 };
 
@@ -83,6 +84,22 @@ impl DaemonClient {
 
     pub async fn wireview_info(&self) -> anyhow::Result<Option<WireViewInfo>> {
         self.make_request(Request::WireViewInfo).await
+    }
+
+    pub async fn boot_guard_status(&self) -> anyhow::Result<BootGuardStatus> {
+        self.make_request(Request::BootGuardStatus).await
+    }
+
+    pub async fn set_boot_guard(&self, config: BootGuardConfig) -> anyhow::Result<BootGuardStatus> {
+        self.make_request(Request::SetBootGuard { config }).await
+    }
+
+    pub async fn boot_guard_resume(&self) -> anyhow::Result<BootGuardStatus> {
+        self.make_request(Request::BootGuardResume).await
+    }
+
+    pub async fn boot_guard_acknowledge(&self) -> anyhow::Result<BootGuardStatus> {
+        self.make_request(Request::BootGuardAcknowledge).await
     }
 
     pub async fn wireview_status(&self) -> anyhow::Result<WireViewStatus> {
