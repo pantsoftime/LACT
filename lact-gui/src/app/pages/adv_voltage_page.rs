@@ -812,7 +812,6 @@ impl BootGuardPanel {
             .build();
 
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        controls.append(&heading("Boot guard"));
         controls.append(&info_icon(
             "Protects against a tuned profile being re-applied at boot after it hung or crashed the system. \
              A login notice is also written to /run/motd.d while engaged.",
@@ -1510,10 +1509,6 @@ impl relm4::Component for AdvVoltagePage {
             .build();
         content.append(&status_label);
 
-        // ---- boot guard: the fallback switch, above everything it protects
-        let boot_guard = BootGuardPanel::new(client);
-        content.append(&boot_guard.frame);
-
         // ---- live telemetry row: a flow box, so extra tiles wrap on a
         // narrow window instead of squeezing the row; homogeneous keeps the
         // tiles the same width.
@@ -1851,6 +1846,11 @@ impl relm4::Component for AdvVoltagePage {
         content.append(&curves_header);
         let curves = CurveChart::new();
         content.append(&curves.frame);
+
+        // ---- Boot guard: the fallback switch for everything above
+        content.append(&section_label("Boot guard"));
+        let boot_guard = BootGuardPanel::new(client);
+        content.append(&boot_guard.frame);
 
         // ---- Tests: the tooling repo's scripts, run from here
         content.append(&section_label("Tests"));

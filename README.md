@@ -66,7 +66,7 @@ the ones only this page reaches.
 | --- | --- |
 | ![Advanced page: telemetry tiles including the rail currents, the core and fabric cards and the two rail-limit cards](./res/screenshots/advanced-1.png) | ![Advanced page: memory, power-limit and OCP cards, the boost-limit panel, the clock domain V/F curves and the test runner](./res/screenshots/advanced-2.png) |
 
-The **Boot guard** row at the top of the page is the safety net for the rest
+The **Boot guard** row, between the V/F curves and the tests, is the safety net for the rest
 of it: with it on, the daemon writes a marker before applying settings and
 clears it on a clean shutdown. A marker still present at the next start means
 the system crashed, hung or lost power with that profile active, so the
