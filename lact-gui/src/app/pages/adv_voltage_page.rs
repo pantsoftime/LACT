@@ -1808,8 +1808,9 @@ impl relm4::Component for AdvVoltagePage {
              tops out at 3217 MHz). That is how a voltage limit becomes a clock ceiling.\n\
              • MSVDD voltage rows have no arrow: this object only reports a core result, and those \
              limits act on the fabric rail. P-state style clients carry no frequency at all.\n\
-             • Rows marked (floor) are minimums — the lowest clock the boost controller allows, not a \
-             cap — and are excluded from the summary. Low floors mean the card is idle.\n\
+             • Floor rows (named \"… floor\" / _MIN) are minimums — the lowest clock the boost \
+             controller allows, not a cap — and are excluded from the summary. Low floors mean the \
+             card is idle.\n\
              • \"P-state limit (level N)\" rows carry a P-state level instead of a clock; the level's \
              meaning is not decoded.\n\
              • The Blackwell clients NVML has no name for come in two triples (P-state, GPC, XBAR): \
@@ -2057,14 +2058,13 @@ impl AdvVoltagePage {
             .iter()
             .map(|l| {
                 format!(
-                    "{:<44} {:>9} {:>9}{}   {}",
+                    "{:<44} {:>9} {:>9}   {}",
                     l.name,
                     l.limit_mhz
                         .map(|m| format!("{m} MHz"))
                         .or_else(|| l.limit_mv.map(|v| format!("{v} mV")))
                         .unwrap_or_default(),
                     l.result_mhz.map_or(String::new(), |m| format!("→ {m}")),
-                    if l.is_minimum { "  (floor)" } else { "" },
                     l.nvml_name
                         .as_deref()
                         .map_or_else(|| format!("id {:#04x}", l.id), |n| format!("[{n}]"))
