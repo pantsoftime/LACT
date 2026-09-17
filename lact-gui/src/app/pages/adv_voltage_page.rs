@@ -1048,10 +1048,10 @@ fn info_icon(note: &str, warning: bool) -> gtk::Image {
 
 fn limit_note(limit: RailLimit) -> &'static str {
     match limit {
-        RailLimit::Vmin => "Delta to the rail's minimum-voltage floor. Raising it holds the rail higher at idle (more idle power); lowering it lets it sag further.",
-        RailLimit::Rel => "Delta to the reliability limit, normally the binding maximum (MAX = tightest of REL / ALT-OP / OV). −50 mV is the driver default on MSVDD here. Raising it alone does nothing while ALT/OP or OV is tighter.",
-        RailLimit::AltRel => "Delta to the alternate-reliability / operating limit (Vop). The vendor's operating ceiling; going above it is XOC territory.",
-        RailLimit::Ov => "Delta to the overvoltage ceiling. Only matters once REL and ALT/OP are above it. Held under the device maximum by the daemon.",
+        RailLimit::Vmin => "VMIN — the rail's minimum-voltage floor. Effect: raising it holds the rail higher at idle (more idle power, no performance); lowering it lets it sag further at idle. Use: normally leave alone.",
+        RailLimit::Rel => "REL — the reliability limit, normally the binding ceiling (MAX = tightest of REL / ALT-OP / OV). Effect: raising it lets boost use higher voltage points, if ALT/OP and OV are not tighter. Use: the first limit to raise for peak clock. Observed: −50 mV is the driver default on MSVDD here.",
+        RailLimit::AltRel => "ALT/OP — the alternate-reliability / operating limit (Vop), the vendor's operating ceiling. Effect: same as REL; whichever is lower binds. Use: raise together with REL. Risk: above it is extreme-overclocking territory.",
+        RailLimit::Ov => "OV — the overvoltage ceiling. Effect: only matters once REL and ALT/OP are both above it. Use: last. Risk: the daemon holds it under the device maximum; nothing here goes past the hardware's own limit.",
     }
 }
 
@@ -1588,7 +1588,15 @@ impl relm4::Component for AdvVoltagePage {
         content.append(&tele);
 
         // ---- Core / NVVDD
-        content.append(&section_label("Core / NVVDD"));
+        {
+            let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            header.append(&section_label("Core / NVVDD"));
+            header.append(&info_icon(
+                "The core (GPC) clock domain and its rail. Every card here is a knob on how fast the shader cores run and at what voltage; power and temperature limits win over all of them.\n\nEach card's tooltip is in four parts: what the control is, what raising or lowering it does, when to use it, and — separately — what was observed on the reference card, which is a data point, not a recommendation.",
+                false,
+            ));
+            content.append(&header);
+        }
         let grid = card_grid();
         let core = Card::new(
             "Core clock offset",
@@ -1596,7 +1604,11 @@ impl relm4::Component for AdvVoltagePage {
             5.0,
             0,
             Control::CoreOffset,
-            "NVML VF offset — the register nvidia-smi and the Overclocking page use. Written for pstate 0 only; other pstate entries are cleared because a stray 0 cancels the value on this driver.",
+            "What it is: the NVML V/F offset for the core (the same register nvidia-smi and the Overclocking page write), MHz added to every point of the boost curve.\n\
+Effect: + raises the clock the core reaches at each voltage step; − lowers it. Power draw rises with clock at a fixed voltage.\n\
+Use: the ordinary core overclock. Raise in 15 MHz steps until a workload errors or the power cap binds, then back off.\n\
+Observed on this card (RTX 5090, XOC vBIOS — not a rule): +150 to +175 daily; written for pstate 0 only because a stray 0 in another pstate cancels the value on this driver.\n\
+Risk: instability shows as application crashes or silent errors; nothing is written to firmware.",
             false,
             &sender,
         );
@@ -1606,7 +1618,10 @@ impl relm4::Component for AdvVoltagePage {
             15.0,
             0,
             Control::BoostLock,
-            "Locks the core clock (NVML locked clocks, min = max = target; the same as nvidia-smi -lgc). Off restores boost.",
+            "What it is: NVML locked clocks with minimum = maximum = the target (nvidia-smi -lgc).\n\
+Effect: the core sits at the target regardless of load or temperature, subject only to the power and thermal limits.\n\
+Use: repeatable benchmarking, or pinning a clock while testing another setting. Off restores normal boost.\n\
+Observed: an idle card at a locked clock burns more power than it needs to; not a daily setting.",
             false,
             &sender,
         );
@@ -1616,7 +1631,10 @@ impl relm4::Component for AdvVoltagePage {
             5.0,
             0,
             Control::Clock(ClockspeedType::VoltageBoost),
-            "LACT's bounded V/F limit shift via NVAPI (PR #1133). Same control as the Overclocking page.",
+            "What it is: LACT's bounded V/F limit shift through NvAPI, in percent of the driver's allowed range (the same control as the Overclocking page).\n\
+Effect: lets the boost algorithm use higher voltage points at the top of the curve, so peak clocks rise when power and temperature allow.\n\
+Use: the first thing to raise for more peak clock on an air- or water-cooled card with headroom. 100 % is the driver's own ceiling, not an unlock.\n\
+Observed on this card: 50 % daily; the last few percent add power faster than clock.",
             false,
             &sender,
         );
@@ -1626,7 +1644,11 @@ impl relm4::Component for AdvVoltagePage {
             5.0,
             0,
             Control::Clock(ClockspeedType::NvvddOffset),
-            "The GPC domain's voltage demand on its own rail (rail 0, from the driver's rail mask). Another domain or a limit can still win the rail. Bounded ±50 mV; untested at any value.",
+            "What it is: the GPC (core) domain's voltage demand offset on its own rail (NVVDD), mV, from the RM clock-domain object.\n\
+Effect: + asks the rail for more voltage at every core clock; − asks for less (an undervolt). Another domain or a rail limit can still decide the rail.\n\
+Use: undervolting the core for efficiency, or a small positive nudge to stabilise a high offset.\n\
+Observed: bounded to ±50 mV by the daemon; not harness-validated at any value on this card. mVolt+'s \"extended voltage\" is this same control with a ±500 mV window.\n\
+Risk: a positive value raises core rail power immediately; large values are outside anything tested here.",
             true,
             &sender,
         );
@@ -1636,7 +1658,15 @@ impl relm4::Component for AdvVoltagePage {
         content.append(&grid);
 
         // ---- Fabric / MSVDD
-        content.append(&section_label("Fabric / MSVDD"));
+        {
+            let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            header.append(&section_label("Fabric / MSVDD"));
+            header.append(&info_icon(
+                "The crossbar (XBAR), SYS and video clock domains and the fabric rail (MSVDD) they share. These are the domains the public tools cannot reach; they matter for fabric-bound work and are where the silent-corruption risk lives, so validate with the harness rather than by eye.",
+                false,
+            ));
+            content.append(&header);
+        }
         let grid = card_grid();
         let xbar = Card::new(
             "XBAR clock offset",
@@ -1644,7 +1674,11 @@ impl relm4::Component for AdvVoltagePage {
             10.0,
             0,
             Control::Clock(ClockspeedType::XbarClockOffset),
-            "Driver range ±1000 MHz, no guard. On the reference card the harness passed +250 (daily) and +300, found silent corruption at +340 and +380 with no crash and no Xid, and +450 hard-locked the machine. The correctness check below is the guard.",
+            "What it is: an offset, MHz, on the XBAR (crossbar / fabric) clock domain through the RM clock-domain interface — a domain the public tools cannot reach.\n\
+Effect: + raises the fabric clock; the SYS and PWR domains follow it through the propagation ratio. The core clock is unchanged.\n\
+Use: the extra performance mVolt+ advertises on Blackwell. Worth trying on fabric-bound workloads; validate with the harness, because errors are silent.\n\
+Observed on this card: +250 daily, +300 passed; silent corruption at +340 and +380 with no crash and no driver error; +270 on an LLM decode gained 0.4 %.\n\
+Risk: silent data corruption above the stable point — it will not tell you. Driver range ±1000 MHz, no guard.",
             true,
             &sender,
         );
@@ -1654,7 +1688,10 @@ impl relm4::Component for AdvVoltagePage {
             5.0,
             0,
             Control::Clock(ClockspeedType::MsvddOffset),
-            "+20 mV lowered XBAR ~31 MHz on its own and did not extend the ceiling. Not free headroom.",
+            "What it is: the XBAR domain's voltage demand offset on the fabric rail (MSVDD), mV.\n\
+Effect: + asks the fabric rail for more voltage at every XBAR clock; − less. The rail voltage is the maximum of all demands on it, so another domain can hold it up.\n\
+Use: in theory, voltage to hold a higher XBAR offset. Try it only after the clock offset alone fails the harness.\n\
+Observed on this card: +20 mV lowered XBAR by ~31 MHz on its own and did not extend the corruption ceiling — not free headroom.",
             true,
             &sender,
         );
@@ -1664,7 +1701,10 @@ impl relm4::Component for AdvVoltagePage {
             10.0,
             0,
             Control::Clock(ClockspeedType::SysClockOffset),
-            "Domain verified. Not harness-validated at any positive value.",
+            "What it is: an offset, MHz, on the SYS clock domain (the system / host-interface clock) through the RM interface.\n\
+Effect: + raises the SYS clock. It normally follows XBAR through the ratio; this moves it independently.\n\
+Use: rarely useful on its own; leave at 0 unless a workload is known to be SYS-bound.\n\
+Observed: domain verified; never harness-validated at a positive value on this card.",
             false,
             &sender,
         );
@@ -1674,7 +1714,10 @@ impl relm4::Component for AdvVoltagePage {
             10.0,
             0,
             Control::Clock(ClockspeedType::VideoClockOffset),
-            "NVENC / NVDEC only. Verified domain; not harness-validated.",
+            "What it is: an offset, MHz, on the video clock domain (NVENC / NVDEC engines) through the RM interface.\n\
+Effect: faster encode / decode engines only; no effect on graphics or compute.\n\
+Use: streaming or transcoding workloads. Verify with an encode job, not a game.\n\
+Observed: domain verified; not harness-validated at any value.",
             false,
             &sender,
         );
@@ -1684,7 +1727,10 @@ impl relm4::Component for AdvVoltagePage {
             5.0,
             0,
             Control::Clock(ClockspeedType::SysVoltageOffset),
-            "The SYS domain's voltage demand on the fabric rail. Same caveats as the XBAR demand. Untested at any value.",
+            "What it is: the SYS domain's voltage demand offset on the fabric rail, mV.\n\
+Effect: the same as the XBAR demand — a request to the shared MSVDD rail, of which the highest demand wins.\n\
+Use: only with a SYS clock offset that needs it. Untested here.\n\
+Risk: raises fabric rail power for every domain on the rail.",
             true,
             &sender,
         );
@@ -1694,7 +1740,9 @@ impl relm4::Component for AdvVoltagePage {
             5.0,
             0,
             Control::Clock(ClockspeedType::VideoVoltageOffset),
-            "The video domain's voltage demand on the fabric rail. NVENC / NVDEC only. Untested at any value.",
+            "What it is: the video domain's voltage demand offset on the fabric rail, mV.\n\
+Effect: a request to the MSVDD rail for the NVENC / NVDEC clock.\n\
+Use: only with a video clock offset that needs it. Untested here.",
             true,
             &sender,
         );
@@ -1704,7 +1752,10 @@ impl relm4::Component for AdvVoltagePage {
             0.005,
             3,
             Control::Ratio,
-            "The clock arbiter's GPC→XBAR propagation ratio (factory 0.900 on GB202). A constraint, not XBAR = GPC × ratio: XBAR and SYS follow the core higher when it binds. Off = factory. Not harness-validated at any value; 0.90–0.95 was another tester's adoption envelope, 1.20 raised XBAR 174 MHz in their A/B.",
+            "What it is: the clock arbiter's GPC→XBAR propagation ratio (factory 0.900 on GB202), the constraint that keeps the fabric clock at least this fraction of the core clock.\n\
+Effect: it is a floor, not XBAR = GPC × ratio: XBAR and SYS follow the core upward when the constraint binds. Raising it pulls the fabric up with the core; lowering it lets the fabric lag.\n\
+Use: an alternative to a fixed XBAR offset that scales with the core clock. Both together compound.\n\
+Observed on this card: the same silent-corruption ceiling applies to the resulting XBAR clock, whichever control gets there.",
             true,
             &sender,
         );
@@ -1722,19 +1773,34 @@ impl relm4::Component for AdvVoltagePage {
         content.append(&grid);
 
         // ---- Voltage limits: the two tall cards share a row of their own
-        content.append(&section_label("Voltage limits"));
+        {
+            let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            header.append(&section_label("Voltage limits"));
+            header.append(&info_icon(
+                "The voltage-policy limits of each rail and their live target / sensed voltage. The limits are the ceilings the boost algorithm is allowed to use; the deltas shift them. This is where peak clocks come from once the ordinary offsets are exhausted, and where the reliability margin lives.",
+                false,
+            ));
+            content.append(&header);
+        }
         let rails_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         rails_row.set_homogeneous(true);
         let nvvdd_rail = RailCard::new(
             "NVVDD voltage limits",
             0,
-            "Deltas (mV) to the core rail's voltage-policy limits. MAX = the tightest of REL / ALT-OP / OV is what binds; a raised limit is held under the device maximum. Not harness-validated at any value.",
+            "What it is: deltas, mV, to the core rail's voltage-policy limits. MAX (the tightest of REL, ALT/OP and OV) is the ceiling the boost algorithm may use; VMIN is the floor.\n\
+Effect: raising the binding limit lets the V/F curve run to higher voltage points, so peak clock can rise; the daemon holds any raised limit under the device maximum.\n\
+Use: the last step for peak clocks once voltage boost is at 100 % and power allows. Raise REL and ALT/OP together; OV only once both exceed it.\n\
+Observed on this card: shown as it is; no limit delta is part of the daily profile.\n\
+Risk: this is the reliability margin — voltage above the vendor's operating limit ages the silicon.",
             &sender,
         );
         let msvdd_rail = RailCard::new(
             "MSVDD voltage limits",
             1,
-            "Deltas (mV) to the fabric rail's policy limits; −50 on REL is the driver default here. Finding 21: +30 mV here did not make XBAR +340 compute correctly, so this is not XBAR headroom on this card.",
+            "What it is: deltas, mV, to the fabric rail's policy limits (−50 mV on REL is the driver's own default here).\n\
+Effect: as for NVVDD, on the MSVDD rail that the XBAR / SYS / video domains share.\n\
+Use: only if a fabric offset is voltage-limited rather than corruption-limited.\n\
+Observed on this card: +30 mV did not make XBAR +340 compute correctly — the fabric ceiling is not a voltage limit.",
             &sender,
         );
         rails_row.append(&nvvdd_rail.frame);
@@ -1742,7 +1808,15 @@ impl relm4::Component for AdvVoltagePage {
         content.append(&rails_row);
 
         // ---- Memory / Power
-        content.append(&section_label("Memory / Power"));
+        {
+            let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            header.append(&section_label("Memory / Power"));
+            header.append(&info_icon(
+                "The memory clock, the board power cap and the two rail current limits. Power is the practical ceiling on this card: at the cap, everything above trades clock for it.",
+                false,
+            ));
+            content.append(&header);
+        }
         let grid = card_grid();
         let mem = Card::new(
             "Memory clock offset",
@@ -1750,7 +1824,10 @@ impl relm4::Component for AdvVoltagePage {
             50.0,
             0,
             Control::MemOffset,
-            "NVML VF offset, pstate 0. GDDR7 errors can show as lower throughput rather than corruption — validate with throughput too.",
+            "What it is: the NVML V/F offset for the memory clock (GDDR7), MHz, pstate 0.\n\
+Effect: + raises the memory data rate. Bandwidth-bound workloads gain directly.\n\
+Use: the ordinary memory overclock. Raise in 250–500 MHz steps and check throughput, not just stability.\n\
+Observed on this card: +6000 daily. GDDR7 error correction can hide errors as lower throughput rather than crashes — a run that got slower is a failed run.",
             false,
             &sender,
         );
@@ -1760,7 +1837,10 @@ impl relm4::Component for AdvVoltagePage {
             5.0,
             0,
             Control::PowerCap,
-            "Off = driver default. At the cap, extra voltage lowers clocks instead of raising power.",
+            "What it is: the board power cap, watts (NVML inside the vBIOS range; below its minimum through the RM client power policy, from 30 W). Off = driver default.\n\
+Effect: at the cap the boost algorithm lowers clocks rather than exceeding the power; extra voltage then costs clock.\n\
+Use: the main efficiency knob. Lower it to trade a little peak clock for a lot of power and heat; raise it only if the card is actually power-bound.\n\
+Observed on this card: 660 W daily of an 800 W XOC range; sustained draw is better cut with the V/F curve than with the cap.",
             false,
             &sender,
         );
@@ -1770,7 +1850,11 @@ impl relm4::Component for AdvVoltagePage {
             10.0,
             0,
             Control::Clock(ClockspeedType::RailCurrentLimit(0)),
-            "The core rail's current limit in the driver's power policies (mVolt+ \"OCP\"), amps. Rated 480 A on the reference card, where the rail drew 307–373 A at 558–613 W: it does not bind at the 620 W TGP, so raising it buys nothing until the power limit is raised. Lowering it caps the core rail's current on its own: at 100 A the card throttled to 150 W within a second (NVML reports it as a power cap). Off = the value found at daemon start. Range 50 A … 2× rated.",
+            "What it is: the core rail's current limit in the driver's power policies (mVolt+ calls it OCP), amps.\n\
+Effect: lower it and the rail is capped on current alone — the card throttles as if power-capped; raise it and nothing changes until the power limit is also raised past the point where the rail's current binds.\n\
+Use: an unlock only matters on cards whose power limit is above what the rail limit allows. Lowering it is a second, current-based cap.\n\
+Observed on this card: rated 480 A; the rail drew 307–373 A at 558–613 W, so it never binds at this TGP. At 100 A the card throttled to 150 W within a second. Off = the value found at daemon start; range 50 A to 2× rated.\n\
+Risk: raising it removes a protection; the wire and connector limits are the WireView's job.",
             true,
             &sender,
         );
@@ -1780,7 +1864,10 @@ impl relm4::Component for AdvVoltagePage {
             10.0,
             0,
             Control::Clock(ClockspeedType::RailCurrentLimit(1)),
-            "The fabric rail's current limit, amps. Rated 180 A on the reference card, where the rail drew about 72 A at the 620 W power limit, so it is nowhere near binding. Lowering it to 50 A throttled the card to 250 W within two seconds (core to 1300–1600 MHz, XBAR pinned by the policy's own client); 100 A did nothing because the reading was already under it. Off = the value found at daemon start. Range 50 A … 2× rated.",
+            "What it is: the fabric rail's current limit in the power policies, amps.\n\
+Effect: as for NVVDD, on the MSVDD rail.\n\
+Use: almost never binding; a low value is a fabric-side throttle.\n\
+Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttled the card to 250 W within two seconds; 100 A did nothing. Off = daemon-start value; range 50 A to 2× rated.",
             true,
             &sender,
         );
@@ -2349,10 +2436,16 @@ impl AdvVoltagePage {
                     0,
                     Control::Clock(ClockspeedType::ThermalInput(s.index)),
                     &format!(
-                        "Fixed value this sensor reports while on (sensor {} of the RM group). Off = the sensor measures. \
-                         Lower than the real temperature removes VFE voltage margin (faster at the same voltage); \
-                         higher adds it. Range {}…{} °C.",
-                        s.index, s.sim_min_c, s.sim_max_c
+                        "What it is: a fixed value this sensor reports instead of measuring (sensor {} of the RM group). Off = measuring.\n\
+                         Effect: the voltage/frequency equations take the die temperature as an input; a value below the real \
+                         temperature removes the voltage margin the firmware adds as the card warms (higher clock at the same \
+                         voltage), a value above adds margin (lower clock). NVML and the thermal-limit policy see the fixed value too.\n\
+                         Use: on a water-cooled card that stays well under its limits, a low input recovers the clock the firmware \
+                         gives away for heat that is not there. Test under a light load and watch the computed sensor.\n\
+                         Observed on this card: 60 °C on the GPU sensor at idle dropped the boost clock from ~3277 to ~1600 MHz.\n\
+                         Risk: the card's own thermal protection reads this channel; keep the value near reality and never \
+                         below the daemon's {} °C floor. Range {}…{} °C.",
+                        s.index, s.sim_min_c, s.sim_min_c, s.sim_max_c
                     ),
                     true,
                     &self.sender,
