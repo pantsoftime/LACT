@@ -97,7 +97,8 @@ impl ClockDomain {
             | ClockspeedType::VideoVoltageOffset
             | ClockspeedType::GpcXbarRatioMilli
             | ClockspeedType::RailLimitDelta(..)
-            | ClockspeedType::RailCurrentLimit(_) => return false,
+            | ClockspeedType::RailCurrentLimit(_)
+            | ClockspeedType::ThermalInput(_) => return false,
             ClockspeedType::Reset => unreachable!(),
         };
         self == domain
@@ -788,6 +789,7 @@ fn clock_title(clock_type: ClockspeedType) -> String {
             format!("Rail {rail} {} limit delta", limit.label())
         }
         ClockspeedType::RailCurrentLimit(rail) => format!("Rail {rail} current limit"),
+        ClockspeedType::ThermalInput(sensor) => format!("Thermal input (sensor {sensor})"),
         ClockspeedType::Reset => unreachable!(),
     }
 }
@@ -817,7 +819,8 @@ fn get_row_step(clock_type: ClockspeedType) -> f64 {
         | ClockspeedType::SysVoltageOffset
         | ClockspeedType::VideoVoltageOffset
         | ClockspeedType::RailLimitDelta(..)
-        | ClockspeedType::RailCurrentLimit(_) => 1.0,
+        | ClockspeedType::RailCurrentLimit(_)
+        | ClockspeedType::ThermalInput(_) => 1.0,
         ClockspeedType::Reset => unreachable!(),
     }
 }

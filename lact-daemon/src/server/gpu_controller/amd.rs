@@ -1063,6 +1063,8 @@ impl GpuController for AmdGpuController {
             },
             throttle_info,
             perf_limits: Vec::new(),
+            thermal_sensors: Vec::new(),
+            memory_timings: Vec::new(),
         }
     }
 

@@ -4,7 +4,9 @@ pub mod nvapi;
 mod rm_perf;
 mod rm_perf_names;
 mod rm_prop;
+mod rm_fb;
 mod rm_pwr;
+mod rm_therm;
 mod rm_vf;
 mod rm_volt;
 
@@ -27,11 +29,13 @@ use amdgpu_sysfs::{
 use anyhow::{Context, anyhow, bail, ensure};
 use clock_client::{ControlBlock, RmClockDomain, RmDomainKind};
 use lact_schema::{
-    NvidiaDomainVfCurve, NvidiaDomainVfPoint, NvidiaPropagationRatio, NvidiaRailCurrentLimit, NvidiaRailLimitDelta, NvidiaVoltageRail, PerfLimitEntry, RailLimit,
+    NvidiaDomainVfCurve, NvidiaDomainVfPoint, NvidiaMemoryTimingRow, NvidiaPropagationRatio, NvidiaRailCurrentLimit, NvidiaRailLimitDelta, NvidiaThermalSensor, NvidiaVoltageRail, PerfLimitEntry, RailLimit,
 };
 use rm_perf::{PerfLimitKind, PerfLimits};
 use rm_prop::PropRelation;
+use rm_fb::MemoryTimings;
 use rm_pwr::PowerPolicies;
+use rm_therm::ThermSensors;
 use rm_volt::VoltRails;
 use driver::power_limit::PowerLimitBounds;
 use driver::DriverHandle;
@@ -64,7 +68,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{select, sync::Notify, time::sleep};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const SUPPORTED_UTIL_TYPES: &[ProcessUtilizationType] = &[
     ProcessUtilizationType::Graphics,
@@ -107,6 +111,14 @@ pub struct NvidiaGpuController {
     lower_power_limit: Option<PowerLimitBounds>,
     perf_limits_cache: RefCell<Option<Cached<Vec<PerfLimitEntry>>>>,
     rail_power_cache: RefCell<Option<Cached<(HashMap<String, f64>, HashMap<String, f64>)>>>,
+    /// Thermal sensor group (simulation = "thermal inputs"), this fork
+    rm_therm: Option<ThermSensors>,
+    /// Sensors that did not follow the last simulation: the watchdog's guards
+    therm_guards: RefCell<Vec<u8>>,
+    therm_cache: RefCell<Option<Cached<Vec<NvidiaThermalSensor>>>>,
+    /// FBPA timing registers, this fork (root only)
+    rm_fb: Option<MemoryTimings>,
+    timings_cache: RefCell<Option<Cached<Vec<NvidiaMemoryTimingRow>>>>,
     nvapi_therm_channel_mask: Option<i32>,
 
     last_util_timestamp: Cell<Option<u64>>,
@@ -294,6 +306,21 @@ impl NvidiaGpuController {
             _ => None,
         };
 
+        let rm_therm = driver_handle.as_ref().and_then(|handle| match ThermSensors::probe(handle) {
+            Ok(therm) => Some(therm),
+            Err(err) => {
+                warn!("RM thermal inputs disabled: {err:#}");
+                None
+            }
+        });
+        let rm_fb = driver_handle.as_ref().and_then(|handle| match MemoryTimings::probe(handle) {
+            Ok(fb) => Some(fb),
+            Err(err) => {
+                warn!("memory timings disabled: {err:#}");
+                None
+            }
+        });
+
         Ok(Self {
             nvml,
             nvapi: nvapi.zip(nvapi_handle),
@@ -307,6 +334,11 @@ impl NvidiaGpuController {
             lower_power_limit,
             perf_limits_cache: RefCell::new(None),
             rail_power_cache: RefCell::new(None),
+            rm_therm,
+            therm_guards: RefCell::new(Vec::new()),
+            therm_cache: RefCell::new(None),
+            rm_fb,
+            timings_cache: RefCell::new(None),
             nvapi_therm_channel_mask,
             initial_target_temp: target_temp,
             last_util_timestamp: Cell::new(None),
@@ -554,6 +586,157 @@ impl NvidiaGpuController {
         pwr.set_limits_ma(handle, wanted)
             .context("Could not apply the rail current limits")?;
         Ok(())
+    }
+
+    /// Every RM thermal sensor with its reading and simulation state.
+    fn rm_thermal_sensors(&self) -> Vec<NvidiaThermalSensor> {
+        let (Some(handle), Some(therm)) = (self.driver_handle.as_ref(), self.rm_therm.as_ref()) else {
+            return Vec::new();
+        };
+        let readings = match therm.readings(handle) {
+            Ok(r) => r,
+            Err(err) => {
+                warn!("could not read the thermal sensors: {err:#}");
+                return Vec::new();
+            }
+        };
+        therm
+            .sensors()
+            .iter()
+            .zip(readings)
+            .map(|(s, r)| NvidiaThermalSensor {
+                index: s.index,
+                name: s.name(),
+                temp_c: r.temp_c,
+                sim_enabled: r.sim_enabled,
+                sim_c: r.sim_c,
+                // Only sensors that report something are worth simulating;
+                // the driver takes the write on any of them.
+                can_simulate: r.temp_c.is_some() || r.sim_enabled,
+                sim_min_c: rm_therm::SIM_MIN_C,
+                sim_max_c: rm_therm::SIM_MAX_C,
+            })
+            .collect()
+    }
+
+    /// The GDDR timings per partition, read-only.
+    fn rm_memory_timings(&self) -> Vec<NvidiaMemoryTimingRow> {
+        let (Some(handle), Some(fb)) = (self.driver_handle.as_ref(), self.rm_fb.as_ref()) else {
+            return Vec::new();
+        };
+        match fb.read(handle) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(name, t)| NvidiaMemoryTimingRow {
+                    name,
+                    cl: t.cl,
+                    wl: t.wl,
+                    rc: t.rc,
+                    rfc: t.rfc,
+                    ras: t.ras,
+                    rp: t.rp,
+                    rd_rcd: t.rd_rcd,
+                    wr_rcd: t.wr_rcd,
+                })
+                .collect(),
+            Err(err) => {
+                warn!("could not read the memory timings: {err:#}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Apply the configured thermal inputs; a sensor absent from the map is
+    /// returned to what the daemon found at start. Refused alongside LACT's
+    /// own fan control, whose curve would follow the simulated reading.
+    fn apply_rm_thermal_inputs(&self, clocks: &ClocksConfiguration, fan_control_enabled: bool) -> anyhow::Result<()> {
+        let (Some(handle), Some(therm)) = (self.driver_handle.as_ref(), self.rm_therm.as_ref()) else {
+            if !clocks.thermal_inputs.is_empty() {
+                warn!("thermal inputs in the config were not applied: the sensor group is not available on this driver");
+            }
+            return Ok(());
+        };
+        if fan_control_enabled && !clocks.thermal_inputs.is_empty() {
+            // Nothing written yet: make sure nothing is left on either.
+            therm.restore_all(handle).ok();
+            bail!("Thermal inputs cannot be combined with LACT fan control: the fan curve would follow the simulated temperature");
+        }
+        for (sensor, c) in &clocks.thermal_inputs {
+            ensure!(
+                therm.sensors().iter().any(|s| s.index == *sensor),
+                "thermal input for unknown sensor {sensor}"
+            );
+            ensure!(
+                (rm_therm::SIM_MIN_C..=rm_therm::SIM_MAX_C).contains(c),
+                "thermal input {c} °C for sensor {sensor} is outside {}…{} °C",
+                rm_therm::SIM_MIN_C,
+                rm_therm::SIM_MAX_C
+            );
+        }
+        let before = therm.readings(handle)?;
+        for s in therm.sensors() {
+            let wanted = clocks.thermal_inputs.get(&s.index).copied();
+            therm
+                .set_simulation(handle, s.index, wanted)
+                .with_context(|| format!("Could not set the thermal input of sensor {} ({})", s.index, s.name()))?;
+        }
+        // Guards: sensors that still read their own measurement — those not
+        // simulated and not within a degree of any simulated value.
+        let after = therm.readings(handle)?;
+        let guards: Vec<u8> = if clocks.thermal_inputs.is_empty() {
+            Vec::new()
+        } else {
+            after
+                .iter()
+                .zip(&before)
+                .filter(|(a, _)| !a.sim_enabled)
+                .filter(|(a, b)| match (a.temp_c, b.temp_c) {
+                    (Some(now), Some(was)) => {
+                        #[allow(clippy::cast_precision_loss)]
+                        let near_sim = clocks.thermal_inputs.values().any(|c| (now - *c as f32).abs() < 1.0);
+                        (now - was).abs() < 3.0 && !near_sim
+                    }
+                    _ => false,
+                })
+                .map(|(a, _)| a.index)
+                .collect()
+        };
+        if !clocks.thermal_inputs.is_empty() {
+            if guards.is_empty() {
+                warn!("thermal inputs active with NO independent sensor to guard them: the card's own thermal protection may be blind");
+            } else {
+                info!("thermal inputs active; guarded by sensors {guards:?}");
+            }
+        }
+        *self.therm_guards.borrow_mut() = guards;
+        self.therm_cache.borrow_mut().take();
+        Ok(())
+    }
+
+    /// While a simulation is on, clear every simulation if a guard sensor
+    /// gets hot: the simulated value hides the real die temperature from
+    /// the card's own policies.
+    fn thermal_watchdog(&self, sensors: &[NvidiaThermalSensor]) {
+        const GUARD_LIMIT_C: f32 = 95.0;
+        if !sensors.iter().any(|s| s.sim_enabled) {
+            return;
+        }
+        let guards = self.therm_guards.borrow();
+        let hot = sensors
+            .iter()
+            .filter(|s| guards.contains(&s.index))
+            .filter_map(|s| s.temp_c.map(|t| (s.name.clone(), t)))
+            .find(|(_, t)| *t >= GUARD_LIMIT_C);
+        drop(guards);
+        if let Some((name, t)) = hot
+            && let (Some(handle), Some(therm)) = (self.driver_handle.as_ref(), self.rm_therm.as_ref())
+        {
+            error!("thermal watchdog: {name} reads {t:.0} °C while a thermal input is active; clearing every simulation");
+            if let Err(err) = therm.restore_all(handle) {
+                error!("thermal watchdog could not clear the simulations: {err:#}");
+            }
+            self.therm_cache.borrow_mut().take();
+        }
     }
 
     /// Apply the configured rail limit deltas; `None` = the value found at
@@ -1929,6 +2112,12 @@ impl GpuController for NvidiaGpuController {
                 sensors: self.rm_voltage_sensors(),
             },
             perf_limits: self.cached(&self.perf_limits_cache, || self.rm_perf_limits()),
+            thermal_sensors: {
+                let sensors = self.cached(&self.therm_cache, || self.rm_thermal_sensors());
+                self.thermal_watchdog(&sensors);
+                sensors
+            },
+            memory_timings: self.cached(&self.timings_cache, || self.rm_memory_timings()),
             performance_level: None,
             active_power_states: active_pstate.map(|active_pstate| ActivePowerStates {
                 core: Some(active_pstate),
@@ -2043,6 +2232,7 @@ impl GpuController for NvidiaGpuController {
             gpc_xbar_ratio: self.rm_propagation_ratio(),
             voltage_rails: self.rm_voltage_rails(),
             domain_vf_curves: self.rm_domain_vf_curves(),
+            thermal_sensors: self.rm_thermal_sensors(),
             rm_clock_domains: rm_block
                 .as_ref()
                 .map(|b| self.rm_domain_table(b))
@@ -2166,6 +2356,7 @@ impl GpuController for NvidiaGpuController {
             self.apply_rm_propagation(clocks)?;
             self.apply_rm_rail_limits(clocks)?;
             self.apply_rm_rail_current_limits(clocks)?;
+            self.apply_rm_thermal_inputs(clocks, config.fan_control_enabled)?;
 
             if config.fan_control_enabled {
                 let settings = config

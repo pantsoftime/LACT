@@ -45,6 +45,9 @@ system.
 - #### Overclocking
   - GPU/VRAM clocks configuration
   - GPU undervolting (via voltage offset on AMD, VF curve on Nvidia)
+- #### Thermal inputs and memory timings (this fork, NVIDIA)
+  - Fixed thermal inputs: pin an RM thermal sensor to a value so the VFE (and everything else) sees it — with a floor, a fan-control interlock and a watchdog
+  - Read-only GDDR7 timings per frame-buffer partition (CL/WL/RC/RFC/RAS/RP/RD_RCD/WR_RCD)
 - #### Settings profiles
   - Automatic profile activation based on running processes or gamemode status
   - Boot guard (this fork): after a crash or hang the saved profile is not re-applied at boot; a fallback (stock by default) is, with a banner in the GUI and a login notice in the terminal until you resume

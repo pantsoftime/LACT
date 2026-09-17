@@ -26,7 +26,7 @@ use lact_schema::config::GpuConfig;
 use lact_schema::request::{ClockspeedType, SetClocksCommand};
 use lact_schema::{
     ClocksTable, DeviceStats, NvidiaClockOffset, NvidiaClocksTable, NvidiaDomainVfCurve,
-    NvidiaVoltageRail, RailLimit,
+    NvidiaMemoryTimingRow, NvidiaThermalSensor, NvidiaVoltageRail, RailLimit,
 };
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt};
 use std::cell::{Cell, RefCell};
@@ -1473,6 +1473,13 @@ pub struct AdvVoltagePage {
     /// cards' caption can follow the live reading between table fetches.
     ocp_limits: [Option<lact_schema::NvidiaRailCurrentLimit>; 2],
     table: Option<NvidiaClocksTable>,
+    /// Thermal-input cards, one per simulatable sensor, built from the table
+    thermal_grid: gtk::FlowBox,
+    thermal_cards: RefCell<Vec<(u8, Card)>>,
+    thermal_note: gtk::Label,
+    sender: ComponentSender<AdvVoltagePage>,
+    /// Memory timings, one monospace block
+    timings_label: gtk::Label,
 }
 
 #[relm4::component(pub)]
@@ -1779,6 +1786,51 @@ impl relm4::Component for AdvVoltagePage {
         }
         content.append(&grid);
 
+        // ---- Thermal inputs: simulated sensor readings (mVolt+ v0.44)
+        let thermal_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        thermal_header.append(&section_label("Thermal inputs (VFE)"));
+        thermal_header.append(&info_icon(
+            "Tell a thermal sensor to report a fixed temperature instead of measuring (the driver's \
+             sensor simulation; mVolt+ calls it a thermal input). The voltage/frequency equations take \
+             the die temperature as an input, so a lower value removes the voltage margin the firmware \
+             adds as the card warms — the same lever as on Windows — and NVML, the fan policies and the \
+             thermal-limit policies all see the simulated value.\n\n\
+             That last part is the hazard: a low value can blind the card's own fan curve and thermal \
+             protection. The daemon floors the value at 20 °C, refuses it while LACT's fan control is on, \
+             clears every simulation when the daemon stops or the profile changes, and watches any sensor \
+             that did not follow the simulation, clearing it at 95 °C. Verified on the reference card: \
+             pinning the GPU sensor to 60 °C dropped the idle boost clock from 3277 to about 1600 MHz.",
+            true,
+        ));
+        content.append(&thermal_header);
+        let thermal_note = caption("Sensor group not available on this driver", false);
+        thermal_note.set_width_chars(-1);
+        thermal_note.set_max_width_chars(-1);
+        content.append(&thermal_note);
+        let thermal_grid = card_grid();
+        content.append(&thermal_grid);
+
+        // ---- Memory timings: FBPA CONFIG0/1 per partition, read-only
+        let timings_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        timings_header.append(&section_label("Memory timings"));
+        timings_header.append(&info_icon(
+            "The GDDR7 timings the driver programmed into each frame-buffer partition (FBPA CONFIG0 / \
+             CONFIG1, decoded with NVIDIA's public Memory Tweak Table layout) and the broadcast window, \
+             in memory-controller clocks. Read-only: they change with the memory P-state, so the idle \
+             table differs from the loaded one. The decode checks itself: tRC = tRAS + tRP holds on every \
+             row or the daemon shows nothing.",
+            false,
+        ));
+        content.append(&timings_header);
+        let timings_label = gtk::Label::builder()
+            .label("—")
+            .xalign(0.0)
+            .css_classes(["caption", "dim-label", "monospace"])
+            .build();
+        let timings_frame = gtk::Frame::builder().child(&timings_label).css_classes(["card"]).build();
+        timings_label.set_margin_all(8);
+        content.append(&timings_frame);
+
         // ---- Boost limits: the arbiter's populated limit clients
         content.append(&section_label("Boost limits"));
         let limits_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -1895,6 +1947,11 @@ impl relm4::Component for AdvVoltagePage {
             curves,
             ocp_limits: [None, None],
             table: None,
+            thermal_grid,
+            thermal_cards: RefCell::new(Vec::new()),
+            thermal_note,
+            sender: sender.clone(),
+            timings_label,
         };
 
         let widgets = view_output!();
@@ -1957,6 +2014,13 @@ impl AdvVoltagePage {
             (Some(d), None) => format!("{d:.0} W"),
             _ => "—".to_owned(),
         });
+
+        for (index, card) in self.thermal_cards.borrow().iter() {
+            if let Some(s) = stats.thermal_sensors.iter().find(|s| s.index == *index) {
+                card.set_caption(&thermal_caption(s));
+            }
+        }
+        self.show_memory_timings(&stats.memory_timings);
 
         let currents = &stats.power.current_sensors;
         let powers = &stats.power.sensors;
@@ -2152,6 +2216,7 @@ impl AdvVoltagePage {
         }
 
         self.ocp_limits = ocp_limits;
+        self.show_thermal_sensors(&t.thermal_sensors);
 
         // NVML-backed cards. On this driver the per-pstate offset is one global
         // register, so pstate 0 stands for all of them.
@@ -2244,6 +2309,89 @@ impl AdvVoltagePage {
         }
         self.nvvdd_rail.apply(config);
         self.msvdd_rail.apply(config);
+        for (_, card) in self.thermal_cards.borrow().iter() {
+            card.apply(config);
+        }
+    }
+
+    /// Rebuild the thermal-input cards when the sensor set changes, then
+    /// load each from the table.
+    fn show_thermal_sensors(&self, sensors: &[NvidiaThermalSensor]) {
+        let simulatable: Vec<&NvidiaThermalSensor> = sensors.iter().filter(|s| s.can_simulate).collect();
+        let wanted: Vec<u8> = simulatable.iter().map(|s| s.index).collect();
+        let have: Vec<u8> = self.thermal_cards.borrow().iter().map(|(i, _)| *i).collect();
+        if wanted != have {
+            while let Some(child) = self.thermal_grid.first_child() {
+                self.thermal_grid.remove(&child);
+            }
+            let mut cards = Vec::new();
+            for s in &simulatable {
+                let card = Card::new(
+                    &format!("{} thermal input", s.name),
+                    "°C",
+                    1.0,
+                    0,
+                    Control::Clock(ClockspeedType::ThermalInput(s.index)),
+                    &format!(
+                        "Fixed value this sensor reports while on (sensor {} of the RM group). Off = the sensor measures. \
+                         Lower than the real temperature removes VFE voltage margin (faster at the same voltage); \
+                         higher adds it. Range {}…{} °C.",
+                        s.index, s.sim_min_c, s.sim_max_c
+                    ),
+                    true,
+                    &self.sender,
+                );
+                self.thermal_grid.append(&card.frame);
+                cards.push((s.index, card));
+            }
+            *self.thermal_cards.borrow_mut() = cards;
+        }
+        for (index, card) in self.thermal_cards.borrow().iter() {
+            if let Some(s) = simulatable.iter().find(|s| s.index == *index) {
+                card.load(
+                    s.sim_c.map(f64::from),
+                    f64::from(s.sim_min_c),
+                    f64::from(s.sim_max_c),
+                    50.0,
+                    s.sim_enabled,
+                    &thermal_caption(s),
+                );
+            }
+        }
+        self.thermal_note.set_visible(simulatable.is_empty());
+        if sensors.is_empty() {
+            self.thermal_note.set_label("Sensor group not available on this driver");
+        } else if simulatable.is_empty() {
+            self.thermal_note.set_label("No sensor in the group reports a temperature");
+        }
+    }
+
+    fn show_memory_timings(&self, rows: &[NvidiaMemoryTimingRow]) {
+        if rows.is_empty() {
+            self.timings_label.set_label("Not available (FBPA registers need the system daemon)");
+            return;
+        }
+        let mut text = format!(
+            "{:<10} {:>4} {:>4} {:>4} {:>5} {:>4} {:>4} {:>7} {:>7}\n",
+            "", "CL", "WL", "RC", "RFC", "RAS", "RP", "RD_RCD", "WR_RCD"
+        );
+        for r in rows {
+            text.push_str(&format!(
+                "{:<10} {:>4} {:>4} {:>4} {:>5} {:>4} {:>4} {:>7} {:>7}\n",
+                r.name, r.cl, r.wl, r.rc, r.rfc, r.ras, r.rp, r.rd_rcd, r.wr_rcd
+            ));
+        }
+        self.timings_label.set_label(text.trim_end());
+    }
+}
+
+/// The thermal-input card caption: the live reading and the simulation state.
+fn thermal_caption(s: &NvidiaThermalSensor) -> String {
+    let reading = s.temp_c.map_or("—".to_owned(), |t| format!("{t:.1} °C"));
+    match (s.sim_enabled, s.sim_c) {
+        (true, Some(c)) => format!("Reading {reading}   SIMULATED at {c:.0} °C"),
+        (true, None) => format!("Reading {reading}   simulated"),
+        _ => format!("Reading {reading}   measuring"),
     }
 }
 

@@ -544,6 +544,43 @@ pub struct NvidiaClocksTable {
     /// The V/F curve of every clock domain that keeps one (read-only)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_vf_curves: Vec<NvidiaDomainVfCurve>,
+    /// Thermal sensors the RM exposes with their simulation ("thermal input") state
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thermal_sensors: Vec<NvidiaThermalSensor>,
+}
+
+/// One RM thermal sensor. `sim_c` is the fixed value the sensor is told to
+/// report ("thermal input"): NVML, the VFE and the fan/thermal policies all
+/// see it instead of the measurement.
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NvidiaThermalSensor {
+    pub index: u8,
+    pub name: String,
+    /// The sensor's reading (simulated value while a simulation is on)
+    pub temp_c: Option<f32>,
+    pub sim_enabled: bool,
+    pub sim_c: Option<f32>,
+    /// The daemon accepts a thermal input for this sensor
+    pub can_simulate: bool,
+    /// Accepted simulated range, °C
+    pub sim_min_c: i32,
+    pub sim_max_c: i32,
+}
+
+/// GDDR timings of one frame-buffer partition (or the broadcast window),
+/// in memory-controller clocks. Read-only.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NvidiaMemoryTimingRow {
+    pub name: String,
+    pub cl: u32,
+    pub wl: u32,
+    pub rc: u32,
+    pub rfc: u32,
+    pub ras: u32,
+    pub rp: u32,
+    pub rd_rcd: u32,
+    pub wr_rcd: u32,
 }
 
 /// One clock domain's V/F curve as the driver reports it. Display only:
@@ -796,6 +833,12 @@ pub struct DeviceStats {
     /// the driver exposes them. NVIDIA RM only, for now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub perf_limits: Vec<PerfLimitEntry>,
+    /// RM thermal sensors with their simulation state (this fork, NVIDIA)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thermal_sensors: Vec<NvidiaThermalSensor>,
+    /// GDDR timings per FBPA and broadcast (this fork, NVIDIA, read-only)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_timings: Vec<NvidiaMemoryTimingRow>,
 }
 
 /// A Thermal Grizzly WireView Pro II found on a USB CDC-ACM port (this fork).

@@ -210,6 +210,8 @@ pub enum ClockspeedType {
     RailLimitDelta(u8, crate::RailLimit),
     /// Power-policy current limit of a rail (0 = NVVDD, 1 = MSVDD), amps
     RailCurrentLimit(u8),
+    /// Fixed thermal input of an RM sensor (by group index), °C; None = measured
+    ThermalInput(u8),
 
     MaxMemoryClock,
     MinMemoryClock,

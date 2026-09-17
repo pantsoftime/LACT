@@ -359,3 +359,43 @@ saved — exercises the reboot path. A normal reboot must *not* trip it; that
 is the case to check first. Unit tests cover the marker lifecycle,
 the one-shot, a corrupt marker (an error, not a silent pass) and the config
 round-trip.
+
+## Thermal inputs and memory timings (2026-09-16)
+
+Both are mVolt+ v0.44 features, found by a read-only sweep of the private
+THERMAL control range and two root-run experiments (write-up in the private
+tooling's FINDINGS, "Probe session — thermal inputs and memory timings").
+
+**Thermal inputs** (`nvidia/rm_therm.rs`, cards under "Thermal inputs (VFE)").
+The 24-object thermal-sensor group (RM `0x2080853a/b/c`, SET `0x2080c53d`)
+has, per sensor, a 12-byte control record whose byte +1 enables a
+*simulation* and whose u32 at +4 is the simulated temperature (NvTemp, 24.8).
+With it on, the sensor reports the fixed value: NVML follows, the VFE's
+temperature term takes it (pinning the GPU sensor to 60 °C dropped the idle
+boost clock from 3277 to about 1600 MHz on the reference card), and so do
+the fan and thermal-limit policies. A *lower* value than the die's real
+temperature removes the voltage margin the firmware adds as the card warms —
+the lever mVolt+ sells — and a value low enough can blind the card's own
+protection. The daemon therefore: floors the value at 20 °C (ceiling 110);
+refuses thermal inputs while LACT's own fan control is enabled for the GPU
+(the curve would follow the simulated reading); writes with the object's
+mask bit only, reads back, and restores the start-of-daemon record on any
+disagreement; clears every simulation whenever the config is re-applied
+without one (profile switch, reset, daemon stop); and keeps a *watchdog*: the
+sensors that did not follow the simulation are the guards, and any of them
+reaching 95 °C clears all simulations at once (logged). If no sensor stays
+independent the daemon says so in the log. Per-profile setting:
+`thermal_inputs: {sensor index: °C}`; CLI `lact_set.py --thermal-input 1:40`.
+On GB202 only sensor 1 (GPU) and sensor 2 (a computed value ~10 °C above it)
+report, so those are the two cards.
+
+**Memory timings** (`nvidia/rm_fb.rs`, "Memory timings" table). The driver
+writes the VBIOS Memory Tweak Table CONFIG words into each frame-buffer
+partition's register file; NVIDIA publishes that table's packing, and on
+GB202 CONFIG0/CONFIG1 sit at FBPA base + 0x290 / + 0x294 (unicast
+`0x900000 + i·0x4000`, broadcast `0x9a0000`). The daemon reads them through
+the public `EXEC_REG_OPS` control — allowed only for a privileged client, so
+the system daemon shows them and the GUI's embedded daemon does not — one
+register per call, and refuses the decode unless tRC = tRAS + tRP holds on
+the broadcast word (it does in both P-states here: 84 = 56 + 28 loaded,
+9 = 6 + 3 idle). Read-only; the table changes with the memory P-state.

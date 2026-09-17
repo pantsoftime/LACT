@@ -128,6 +128,11 @@ pub struct ClocksConfiguration {
     /// (mVolt+ "OCP"), amps. `None` = the value found at daemon start.
     pub nvvdd_current_limit_a: Option<i32>,
     pub msvdd_current_limit_a: Option<i32>,
+    /// NVIDIA-only (this fork): fixed thermal inputs — sensor index → simulated °C.
+    /// The sensor reports this value instead of measuring; the VFE and the
+    /// fan / thermal policies follow it.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub thermal_inputs: IndexMap<u8, i32>,
 }
 
 impl ClocksConfiguration {
@@ -185,6 +190,17 @@ impl ClocksConfiguration {
     pub fn any_rail_current_limit(&self) -> bool {
         self.nvvdd_current_limit_a.is_some() || self.msvdd_current_limit_a.is_some()
     }
+
+    pub fn set_thermal_input(&mut self, sensor: u8, value: Option<i32>) {
+        match value {
+            Some(c) => {
+                self.thermal_inputs.insert(sensor, c);
+            }
+            None => {
+                self.thermal_inputs.shift_remove(&sensor);
+            }
+        }
+    }
 }
 
 impl ClocksConfiguration {
@@ -237,6 +253,7 @@ impl ClocksConfiguration {
             ClockspeedType::GpcXbarRatioMilli => self.gpc_xbar_ratio_milli = value,
             ClockspeedType::RailLimitDelta(rail, limit) => self.set_rail_limit_delta(rail, limit, value),
             ClockspeedType::RailCurrentLimit(rail) => self.set_rail_current_limit(rail, value),
+            ClockspeedType::ThermalInput(sensor) => self.set_thermal_input(sensor, value),
             ClockspeedType::Reset => {
                 *self = ClocksConfiguration::default();
             }
