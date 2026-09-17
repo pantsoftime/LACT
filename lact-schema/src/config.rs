@@ -131,7 +131,7 @@ pub struct ClocksConfiguration {
     /// NVIDIA-only (this fork): fixed thermal inputs — sensor index → simulated °C.
     /// The sensor reports this value instead of measuring; the VFE and the
     /// fan / thermal policies follow it.
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty", with = "thermal_inputs_serde")]
     pub thermal_inputs: IndexMap<u8, i32>,
 }
 
@@ -371,5 +371,47 @@ mod tests {
                 .get(&0)
                 .unwrap()
         );
+    }
+}
+
+/// `thermal_inputs` on the wire: JSON map keys are strings, and serde_json
+/// does not turn them back into `u8` for us, so the map is written and read
+/// with decimal string keys ("1": 40).
+mod thermal_inputs_serde {
+    use indexmap::IndexMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(map: &IndexMap<u8, i32>, s: S) -> Result<S::Ok, S::Error> {
+        let by_string: IndexMap<String, i32> = map.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        by_string.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<IndexMap<u8, i32>, D::Error> {
+        let by_string: IndexMap<String, i32> = IndexMap::deserialize(d)?;
+        by_string
+            .into_iter()
+            .map(|(k, v)| {
+                k.parse::<u8>()
+                    .map(|k| (k, v))
+                    .map_err(|_| serde::de::Error::custom(format!("thermal input key {k:?} is not a sensor index")))
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod thermal_inputs_tests {
+    use super::*;
+
+    #[test]
+    fn thermal_inputs_round_trip_json_string_keys() {
+        let mut c = ClocksConfiguration::default();
+        c.thermal_inputs.insert(1, 40);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"thermal_inputs\":{\"1\":40}"), "{json}");
+        let back: ClocksConfiguration = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.thermal_inputs.get(&1), Some(&40));
+        let none: ClocksConfiguration = serde_json::from_str("{}").unwrap();
+        assert!(none.thermal_inputs.is_empty());
     }
 }
