@@ -144,6 +144,9 @@ pub struct SensorReading {
 pub struct ThermSensors {
     mask: [u32; MASK_WORDS],
     sensors: Vec<SensorInfo>,
+    /// Sensors that reported a temperature at probe time: the only ones the
+    /// daemon ever writes.
+    readable: Vec<u8>,
     /// The control block found at daemon start: every restore targets it.
     start_control: Box<Bytes<CONTROL_SIZE>>,
 }
@@ -155,6 +158,22 @@ fn mask_has(mask: &[u32; MASK_WORDS], index: usize) -> bool {
 fn control_entry(block: &[u8], index: u8) -> &[u8] {
     let at = CONTROL_HDR + usize::from(index) * CONTROL_STRIDE;
     &block[at..at + CONTROL_STRIDE]
+}
+
+/// The simulation fields of a control entry: the enable byte and the
+/// temperature word. The other bytes carry state the RM changes on its own
+/// (seen on a sensor without a reading), so they are never compared or
+/// written by the daemon.
+fn sim_fields(entry: &[u8]) -> (u8, [u8; 4]) {
+    (entry[CE_SIM_ENABLE], entry[CE_SIM_TEMP..CE_SIM_TEMP + 4].try_into().unwrap())
+}
+
+fn with_sim_fields(entry: &[u8], fields: (u8, [u8; 4])) -> [u8; CONTROL_STRIDE] {
+    let mut out = [0u8; CONTROL_STRIDE];
+    out.copy_from_slice(entry);
+    out[CE_SIM_ENABLE] = fields.0;
+    out[CE_SIM_TEMP..CE_SIM_TEMP + 4].copy_from_slice(&fields.1);
+    out
 }
 
 impl ThermSensors {
@@ -178,7 +197,7 @@ impl ThermSensors {
         }
 
         let mut sensors = Vec::new();
-        let mut readable = 0;
+        let mut readable = Vec::new();
         for index in 0..MAX_OBJECTS {
             if !mask_has(&mask, index) {
                 continue;
@@ -192,8 +211,9 @@ impl ThermSensors {
             );
             let enable = control.0[ce + CE_SIM_ENABLE];
             ensure!(enable <= 1, "sensor {index} control byte +1 is {enable}, not a flag");
-            if nvtemp_to_c(rd_u32(&status.0, se + SE_TEMP)).is_some() {
-                readable += 1;
+            #[allow(clippy::cast_possible_truncation)]
+            if nvtemp_to_c(rd_u32(&status.0, se + SE_TEMP)).is_some() || enable == 1 {
+                readable.push(index as u8);
             }
             #[allow(clippy::cast_possible_truncation)]
             sensors.push(SensorInfo {
@@ -202,7 +222,7 @@ impl ThermSensors {
                 id: info.0[ie + IE_ID],
             });
         }
-        ensure!(readable > 0, "no sensor in the group reports a temperature");
+        ensure!(!readable.is_empty(), "no sensor in the group reports a temperature");
         ensure!(
             sensors.iter().copied().any(SensorInfo::is_gpu),
             "the GPU sensor (type 2, id 0) is not in the group"
@@ -219,7 +239,7 @@ impl ThermSensors {
         info!(
             "thermal sensor group: {} sensors, {} with readings, simulation {}",
             sensors.len(),
-            readable,
+            readable.len(),
             if sensors.iter().any(|s| control.0[CONTROL_HDR + usize::from(s.index) * CONTROL_STRIDE + CE_SIM_ENABLE] == 1) {
                 "ACTIVE at start"
             } else {
@@ -229,12 +249,18 @@ impl ThermSensors {
         Ok(Self {
             mask,
             sensors,
+            readable,
             start_control: control,
         })
     }
 
     pub fn sensors(&self) -> &[SensorInfo] {
         &self.sensors
+    }
+
+    /// Whether the daemon will write this sensor at all.
+    pub fn is_writable(&self, index: u8) -> bool {
+        self.readable.contains(&index)
     }
 
     fn seed(&self, b: &mut [u8]) {
@@ -285,7 +311,7 @@ impl ThermSensors {
         debug!("THERM sensor {index} SET_CONTROL entry {:02x?}", entry);
         let written = unsafe { handle.query_rm_control(SET_CONTROL, &mut *req) };
         let back = self.read_control(handle);
-        let ok = written.is_ok() && back.as_ref().is_ok_and(|b| control_entry(&b.0, index) == entry);
+        let ok = written.is_ok() && back.as_ref().is_ok_and(|b| sim_fields(control_entry(&b.0, index)) == sim_fields(entry));
         if ok {
             return Ok(());
         }
@@ -295,7 +321,8 @@ impl ThermSensors {
             restore.0[MASK_AT + 4 * w..MASK_AT + 4 * w + 4].copy_from_slice(&0u32.to_le_bytes());
         }
         restore.0[MASK_AT + 4 * word..MASK_AT + 4 * word + 4].copy_from_slice(&bit.to_le_bytes());
-        restore.0[at..at + CONTROL_STRIDE].copy_from_slice(control_entry(&self.start_control.0, index));
+        let start = with_sim_fields(control_entry(&before.0, index), sim_fields(control_entry(&self.start_control.0, index)));
+        restore.0[at..at + CONTROL_STRIDE].copy_from_slice(&start);
         let restored = unsafe { handle.query_rm_control(SET_CONTROL, &mut *restore) };
         match (written, restored) {
             (Err(err), Ok(())) => bail!("sensor {index} SET_CONTROL failed ({err:#}); start value restored"),
@@ -312,31 +339,31 @@ impl ThermSensors {
             self.sensors.iter().any(|s| s.index == index),
             "sensor {index} is not in the group"
         );
+        ensure!(self.is_writable(index), "sensor {index} reports nothing; not written");
         let current = self.read_control(handle)?;
-        let mut entry = [0u8; CONTROL_STRIDE];
-        match temp_c {
+        let now = control_entry(&current.0, index);
+        let fields = match temp_c {
             Some(c) => {
                 ensure!((SIM_MIN_C..=SIM_MAX_C).contains(&c), "simulated {c} °C is outside {SIM_MIN_C}…{SIM_MAX_C} °C");
-                entry.copy_from_slice(control_entry(&current.0, index));
-                entry[CE_SIM_ENABLE] = 1;
-                entry[CE_SIM_TEMP..CE_SIM_TEMP + 4].copy_from_slice(&c_to_nvtemp(c).to_le_bytes());
+                (1, c_to_nvtemp(c).to_le_bytes())
             }
-            None => entry.copy_from_slice(control_entry(&self.start_control.0, index)),
-        }
-        if control_entry(&current.0, index) == entry {
+            None => sim_fields(control_entry(&self.start_control.0, index)),
+        };
+        if sim_fields(now) == fields {
             return Ok(());
         }
-        self.write_entry(handle, index, &entry)
+        self.write_entry(handle, index, &with_sim_fields(now, fields))
     }
 
     /// Clear every simulation the daemon may have set.
     pub fn restore_all(&self, handle: &DriverHandle) -> anyhow::Result<()> {
         let current = self.read_control(handle)?;
         let mut first_err = None;
-        for s in &self.sensors {
-            let start = control_entry(&self.start_control.0, s.index);
-            if control_entry(&current.0, s.index) != start
-                && let Err(err) = self.write_entry(handle, s.index, start)
+        for index in &self.readable {
+            let now = control_entry(&current.0, *index);
+            let start = sim_fields(control_entry(&self.start_control.0, *index));
+            if sim_fields(now) != start
+                && let Err(err) = self.write_entry(handle, *index, &with_sim_fields(now, start))
                 && first_err.is_none()
             {
                 first_err = Some(err);

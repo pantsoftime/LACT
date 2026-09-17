@@ -612,7 +612,7 @@ impl NvidiaGpuController {
                 sim_c: r.sim_c,
                 // Only sensors that report something are worth simulating;
                 // the driver takes the write on any of them.
-                can_simulate: r.temp_c.is_some() || r.sim_enabled,
+                can_simulate: therm.is_writable(s.index),
                 sim_min_c: rm_therm::SIM_MIN_C,
                 sim_max_c: rm_therm::SIM_MAX_C,
             })
@@ -674,11 +674,18 @@ impl NvidiaGpuController {
             );
         }
         let before = therm.readings(handle)?;
-        for s in therm.sensors() {
+        for s in therm.sensors().iter().filter(|s| therm.is_writable(s.index)) {
             let wanted = clocks.thermal_inputs.get(&s.index).copied();
-            therm
+            let result = therm
                 .set_simulation(handle, s.index, wanted)
-                .with_context(|| format!("Could not set the thermal input of sensor {} ({})", s.index, s.name()))?;
+                .with_context(|| format!("Could not set the thermal input of sensor {} ({})", s.index, s.name()));
+            match (result, wanted) {
+                (Ok(()), _) => {}
+                // A requested input that cannot be set fails the apply.
+                (Err(err), Some(_)) => return Err(err),
+                // A clear that fails must not block the rest of the profile.
+                (Err(err), None) => warn!("{err:#}"),
+            }
         }
         // Guards: sensors that still read their own measurement — those not
         // simulated and not within a degree of any simulated value.
