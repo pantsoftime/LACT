@@ -1468,6 +1468,11 @@ pub struct AdvVoltagePage {
     tele_msvdd: gtk::Label,
     limits_summary: gtk::Label,
     limits_list: gtk::Label,
+    /// Every limit client seen since the page loaded, id → (name, tag).
+    /// Clients come and go between polls; keeping their rows (with a dash
+    /// when absent) stops the block from changing height and shifting the
+    /// page below it.
+    limits_seen: RefCell<std::collections::BTreeMap<u32, (String, String)>>,
     curves: CurveChart,
     /// The rail current-limit records from the last clocks table, so the OCP
     /// cards' caption can follow the live reading between table fetches.
@@ -1851,7 +1856,9 @@ impl relm4::Component for AdvVoltagePage {
         limits_header.append(&limits_summary);
         limits_header.append(&info_icon(
             "Every populated limit client of the driver's clock arbiter (RM PERF_LIMITS status), read \
-             live, named with NVIDIA's own names from NVML's table (shown in brackets).\n\n\
+             live, named with NVIDIA's own names from NVML's table (shown in brackets). A client that was \
+             populated earlier keeps its row with a dash while it is not, so the block does not change \
+             height as clients come and go.\n\n\
              The two numbers on a row are the client's own value and what the driver makes of it:\n\
              • Frequency clients ask for a clock, so the first number is MHz and the arrow normally \
              echoes it (\"3375 MHz → 3375\").\n\
@@ -1944,6 +1951,7 @@ impl relm4::Component for AdvVoltagePage {
             tele_msvdd,
             limits_summary,
             limits_list,
+            limits_seen: RefCell::new(std::collections::BTreeMap::new()),
             curves,
             ocp_limits: [None, None],
             table: None,
@@ -2118,21 +2126,29 @@ impl AdvVoltagePage {
             ),
             (true, None) => format!("{} populated clients, none yields a core clock", limits.len()),
         });
-        let mut rows: Vec<String> = limits
+        let mut seen = self.limits_seen.borrow_mut();
+        for l in limits {
+            let tag = l
+                .nvml_name
+                .as_deref()
+                .map_or_else(|| format!("id {:#04x}", l.id), |n| format!("[{n}]"));
+            seen.insert(l.id, (l.name.clone(), tag));
+        }
+        let mut rows: Vec<String> = seen
             .iter()
-            .map(|l| {
-                format!(
-                    "{:<44} {:>9} {:>9}   {}",
-                    l.name,
-                    l.limit_mhz
-                        .map(|m| format!("{m} MHz"))
-                        .or_else(|| l.limit_mv.map(|v| format!("{v} mV")))
-                        .unwrap_or_default(),
-                    l.result_mhz.map_or(String::new(), |m| format!("→ {m}")),
-                    l.nvml_name
-                        .as_deref()
-                        .map_or_else(|| format!("id {:#04x}", l.id), |n| format!("[{n}]"))
-                )
+            .map(|(id, (name, tag))| {
+                let (value, result) = match limits.iter().find(|l| l.id == *id) {
+                    Some(l) => (
+                        l.limit_mhz
+                            .map(|m| format!("{m} MHz"))
+                            .or_else(|| l.limit_mv.map(|v| format!("{v} mV")))
+                            .unwrap_or_default(),
+                        l.result_mhz.map_or(String::new(), |m| format!("→ {m}")),
+                    ),
+                    // Not populated right now: keep the row, blank the numbers.
+                    None => ("—".to_owned(), String::new()),
+                };
+                format!("{name:<44} {value:>9} {result:>9}   {tag}")
             })
             .collect();
         rows.sort();
