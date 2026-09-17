@@ -2000,7 +2000,18 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
         content.append(&boot_guard.frame);
 
         // ---- Tests: the tooling repo's scripts, run from here
-        content.append(&section_label("Tests"));
+        {
+            let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            header.append(&section_label("Tests"));
+            header.append(&info_icon(
+                "The private tooling's validation harness, run from here with the currently applied settings. Use: \
+                 after any change to a fabric offset or ratio, because fabric errors are silent — a run that produces \
+                 a different result digest, or lower throughput, is a failed setting even if nothing crashed. The \
+                 output is the script's own; the tooling directory and Python come from the tooling's config.",
+                false,
+            ));
+            content.append(&header);
+        }
         let (_test_runner, tests_frame) = TestRunner::new();
         content.append(&tests_frame);
 
