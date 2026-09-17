@@ -1990,6 +1990,22 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
              read a point; the readout picks the nearest point on both axes.",
             false,
         ));
+        let open_editor = gtk::Button::builder()
+            .label("Edit GPC curve…")
+            .css_classes(["flat"])
+            .tooltip_text(
+                "Opens the GPC (core) V/F curve editor — the same window as on the Overclocking page. \
+                 Points dragged there are written into the pending config and applied with the Apply button \
+                 like every other setting on this page.",
+            )
+            .build();
+        {
+            let sender = sender.clone();
+            open_editor.connect_clicked(move |_| {
+                let _ = sender.output(AppMsg::ShowVfCurveEditor);
+            });
+        }
+        curves_header.append(&open_editor);
         content.append(&curves_header);
         let curves = CurveChart::new();
         content.append(&curves.frame);

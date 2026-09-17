@@ -20,6 +20,8 @@ pub enum AppMsg {
     /// Boot guard (this fork): polled with the stats
     BootGuardPolled(Arc<lact_schema::boot_guard::BootGuardStatus>),
     BootGuardResume,
+    /// Open the Overclocking page's GPC V/F curve editor window (from the Advanced page)
+    ShowVfCurveEditor,
     ApplyChanges,
     RevertChanges,
     SettingsChanged,

@@ -643,6 +643,9 @@ impl AppModel {
                     self.boot_guard = Some(status);
                 }
             }
+            AppMsg::ShowVfCurveEditor => {
+                self.oc_page.emit(OcPageMsg::ShowVfCurveEditor);
+            }
             AppMsg::BootGuardResume => {
                 let client = self.daemon_client.clone();
                 relm4::spawn_local(async move {
