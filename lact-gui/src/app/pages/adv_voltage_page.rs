@@ -2470,8 +2470,10 @@ impl AdvVoltagePage {
                          Use: on a water-cooled card that stays well under its limits, a low input recovers the clock the firmware \
                          gives away for heat that is not there. Test under a light load and watch the computed sensor.\n\
                          Observed on this card: 60 °C on the GPU sensor at idle dropped the boost clock from ~3277 to ~1600 MHz. \
-                         The Memory junction sensor is the channel the memory-side equations and the memory thermal limit \
-                         read (it equals the hottest GDDR7 chip); its effect on the memory clock is not yet measured here.\n\
+                         The Memory junction sensor is the channel NvAPI/NVML report as the VRAM temperature (it equals the \
+                         hottest GDDR7 chip); simulating it at 95 and 100 °C under load changed nothing on this card — memory \
+                         clock, timings and boost clock all held — so on this driver it only changes what is reported. \
+                         The GDDR7 refresh/timing compensation reads the chips' own registers, which this does not touch.\n\
                          Risk: the card's own thermal protection reads this channel; keep the value near reality and never \
                          below the daemon's {} °C floor. Range {}…{} °C.",
                         s.index, s.sim_min_c, s.sim_min_c, s.sim_max_c
