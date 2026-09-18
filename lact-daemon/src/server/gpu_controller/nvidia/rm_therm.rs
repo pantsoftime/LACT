@@ -4,9 +4,10 @@
 //! `0x2080853a`, GET_STATUS `0x2080853b`, GET_CONTROL `0x2080853c`,
 //! SET_CONTROL `0x2080c53d` — is what NvAPI's thermal-reading entry point
 //! (0x65FE3AAD) reads. Each object is one sensor: on GB202 object 1 is the
-//! GPU die sensor NVML reports, object 2 a computed value about 10 °C above
-//! it, and fifteen type-3 objects are the GDDR7 chips, which report nothing
-//! on this driver.
+//! GPU die sensor NVML reports, object 2 (type 4) the **memory junction** —
+//! it reads exactly what LACT's NvAPI VRAM channel and the hottest GDDR7
+//! chip register report — and fifteen type-3 objects are the individual
+//! GDDR7 chips, which report nothing through this group on this driver.
 //!
 //! The 12-byte control record of an object has a *simulation* pair: byte +1
 //! enables it and the u32 at +4 is the simulated NvTemp (24.8 fixed). With
@@ -60,7 +61,7 @@ const CE_SIM_TEMP: usize = 0x04;
 const NO_READING: u32 = 0xff00;
 const GPU_SENSOR_TYPE: u8 = 2;
 const GPU_SENSOR_ID: u8 = 0;
-const COMPUTED_SENSOR_TYPE: u8 = 4;
+const MEMORY_JUNCTION_TYPE: u8 = 4;
 const MEMORY_SENSOR_TYPE: u8 = 3;
 
 /// Simulated values the daemon will write, °C. The floor keeps the fan and
@@ -119,7 +120,7 @@ impl SensorInfo {
     pub fn name(self) -> String {
         match (self.kind, self.id) {
             (GPU_SENSOR_TYPE, GPU_SENSOR_ID) => "GPU".to_owned(),
-            (COMPUTED_SENSOR_TYPE, _) => "GPU (computed)".to_owned(),
+            (MEMORY_JUNCTION_TYPE, _) => "Memory junction".to_owned(),
             (MEMORY_SENSOR_TYPE, id) => format!("Memory chip {id:#04x}"),
             (kind, id) => format!("Sensor {} (type {kind}, id {id:#04x})", self.index),
         }

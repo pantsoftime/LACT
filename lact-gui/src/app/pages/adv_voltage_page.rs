@@ -2469,7 +2469,9 @@ impl AdvVoltagePage {
                          voltage), a value above adds margin (lower clock). NVML and the thermal-limit policy see the fixed value too.\n\
                          Use: on a water-cooled card that stays well under its limits, a low input recovers the clock the firmware \
                          gives away for heat that is not there. Test under a light load and watch the computed sensor.\n\
-                         Observed on this card: 60 °C on the GPU sensor at idle dropped the boost clock from ~3277 to ~1600 MHz.\n\
+                         Observed on this card: 60 °C on the GPU sensor at idle dropped the boost clock from ~3277 to ~1600 MHz. \
+                         The Memory junction sensor is the channel the memory-side equations and the memory thermal limit \
+                         read (it equals the hottest GDDR7 chip); its effect on the memory clock is not yet measured here.\n\
                          Risk: the card's own thermal protection reads this channel; keep the value near reality and never \
                          below the daemon's {} °C floor. Range {}…{} °C.",
                         s.index, s.sim_min_c, s.sim_min_c, s.sim_max_c
