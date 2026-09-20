@@ -943,10 +943,13 @@ impl relm4::Component for WireViewPage {
     }
 }
 
-fn set_page_visible(root: &gtk::ScrolledWindow, visible: bool) {
-    if let Some(stack) = root.parent().and_downcast::<gtk::Stack>() {
-        stack.page(root).set_visible(visible);
-    }
+fn set_page_visible(_root: &gtk::ScrolledWindow, visible: bool) {
+    // The page sits inside a detachable wrapper now, so the stack is not the
+    // direct parent: ask the navigation component instead.
+    crate::app::APP_BROKER.send(crate::app::msg::AppMsg::SetPageVisible(
+        crate::app::pages::PageId::WireView,
+        visible,
+    ));
 }
 
 fn make_editor(k: &Key, edited: &(impl Fn() + Clone + 'static)) -> (gtk::Widget, Editor) {

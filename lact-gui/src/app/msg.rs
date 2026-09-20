@@ -22,6 +22,8 @@ pub enum AppMsg {
     BootGuardResume,
     /// Open the Overclocking page's GPC V/F curve editor window (from the Advanced page)
     ShowVfCurveEditor,
+    /// Show or hide a page in the sidebar and stack (the WireView page hides itself when no device is present)
+    SetPageVisible(crate::app::pages::PageId, bool),
     ApplyChanges,
     RevertChanges,
     SettingsChanged,
