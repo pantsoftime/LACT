@@ -591,12 +591,24 @@ pub struct NvidiaDomainVfCurve {
     /// The voltage rail the curve is on (NVVDD for GPC, MSVDD for the rest on GB202)
     pub rail: String,
     pub points: Vec<NvidiaDomainVfPoint>,
+    /// The daemon accepts per-point offsets for this curve (XBAR / SYS / video;
+    /// the core curve has its own editor, PWRCLK follows XBAR)
+    #[serde(default)]
+    pub editable: bool,
+    /// Accepted per-point offset range, MHz
+    #[serde(default)]
+    pub offset_min_mhz: i32,
+    #[serde(default)]
+    pub offset_max_mhz: i32,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NvidiaDomainVfPoint {
     pub voltage_mv: u32,
     pub freq_mhz: u32,
+    /// The per-point offset the driver holds for this point, MHz (included in `freq_mhz`)
+    #[serde(default)]
+    pub offset_mhz: i32,
 }
 
 /// The GPC→XBAR clock propagation ratio of the active clock topology.

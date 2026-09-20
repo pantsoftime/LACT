@@ -83,6 +83,11 @@ const VOLTAGE_BOOST_RANGE: RangeInclusive<i32> = 0..=100;
 /// ~27 ms, and the 400 KB power-policy STATUS, ~6 ms) are refreshed at most
 /// this often, whatever rate the GUI polls stats at.
 const RM_TELEMETRY_TTL: Duration = Duration::from_millis(900);
+/// Per-point V/F curve offsets this fork will write, MHz. Negative is the
+/// safe direction (slower at that voltage); the positive side is kept well
+/// under the domain offset range because fabric errors are silent.
+const VF_POINT_OFFSET_MIN_MHZ: i32 = -1000;
+const VF_POINT_OFFSET_MAX_MHZ: i32 = 300;
 
 struct Cached<T> {
     at: Instant,
@@ -1714,6 +1719,74 @@ impl NvidiaGpuController {
     }
 
     /// Every domain's V/F curve, named and tagged with its rail (display only).
+    /// The curves this fork writes: the fabric-side domains whose per-point
+    /// writes were verified (XBAR, SYS, video). The core curve has upstream's
+    /// own editor; PWRCLK follows XBAR through the propagation ratio.
+    fn domain_curve_editable(domain: &RmClockDomain) -> bool {
+        matches!(domain.kind, Some(RmDomainKind::Xbar | RmDomainKind::Sys | RmDomainKind::Video))
+    }
+
+    /// Apply the configured per-point curve offsets; a domain absent from
+    /// the config, and every point absent from a domain, goes back to zero.
+    fn apply_rm_domain_vf_offsets(&self, clocks: &ClocksConfiguration) -> anyhow::Result<()> {
+        let Some((handle, domains)) = self.rm() else {
+            if !clocks.domain_vf_offsets.is_empty() {
+                warn!("V/F curve offsets in the config were not applied: the RM clock interface is not available on this driver");
+            }
+            return Ok(());
+        };
+        for name in clocks.domain_vf_offsets.keys() {
+            ensure!(
+                domains.iter().any(|d| d.name() == *name && Self::domain_curve_editable(d)),
+                "V/F curve offsets for {name}: not an editable curve on this card"
+            );
+        }
+        let curves = match rm_vf::read_domain_curves(handle, domains) {
+            Ok(curves) => curves,
+            Err(err) => {
+                if clocks.domain_vf_offsets.is_empty() {
+                    return Ok(());
+                }
+                return Err(err.context("Could not read the V/F curves before writing offsets"));
+            }
+        };
+        for curve in &curves {
+            let Some(domain) = domains.iter().find(|d| d.index == curve.domain_index) else {
+                continue;
+            };
+            if !Self::domain_curve_editable(domain) {
+                continue;
+            }
+            let name = domain.name();
+            let wanted: Vec<(u8, i32)> = clocks
+                .domain_vf_offsets
+                .get(&name)
+                .map(|points| points.iter().map(|(p, mhz)| (*p, *mhz)).collect())
+                .unwrap_or_default();
+            for (point, mhz) in &wanted {
+                ensure!(
+                    usize::from(*point) < curve.points.len(),
+                    "{name} curve point {point} does not exist ({} points)",
+                    curve.points.len()
+                );
+                ensure!(
+                    (VF_POINT_OFFSET_MIN_MHZ..=VF_POINT_OFFSET_MAX_MHZ).contains(mhz),
+                    "{name} curve point {point}: offset {mhz} MHz is outside {VF_POINT_OFFSET_MIN_MHZ}…{VF_POINT_OFFSET_MAX_MHZ} MHz"
+                );
+            }
+            // Nothing configured and nothing on the card: no RM traffic.
+            if wanted.is_empty() && curve.points.iter().all(|p| p.offset_mhz == 0) {
+                continue;
+            }
+            let written = rm_vf::write_bank_offsets(handle, curve.bank_start, curve.points.len(), &wanted)
+                .with_context(|| format!("Could not apply the {name} V/F curve offsets"))?;
+            if written > 0 {
+                info!("{name} V/F curve: {written} point offsets written and verified");
+            }
+        }
+        Ok(())
+    }
+
     fn rm_domain_vf_curves(&self) -> Vec<NvidiaDomainVfCurve> {
         let Some((handle, domains)) = self.rm() else {
             return Vec::new();
@@ -1734,6 +1807,7 @@ impl NvidiaGpuController {
                     2 => "MSVDD",
                     _ => "?",
                 };
+                let editable = Self::domain_curve_editable(domain);
                 Some(NvidiaDomainVfCurve {
                     domain: domain.name(),
                     rail: rail.to_owned(),
@@ -1743,8 +1817,12 @@ impl NvidiaGpuController {
                         .map(|p| NvidiaDomainVfPoint {
                             voltage_mv: p.voltage_mv,
                             freq_mhz: p.freq_mhz,
+                            offset_mhz: p.offset_mhz,
                         })
                         .collect(),
+                    editable,
+                    offset_min_mhz: if editable { VF_POINT_OFFSET_MIN_MHZ } else { 0 },
+                    offset_max_mhz: if editable { VF_POINT_OFFSET_MAX_MHZ } else { 0 },
                 })
             })
             .collect()
@@ -2360,6 +2438,7 @@ impl GpuController for NvidiaGpuController {
             }
 
             self.apply_rm_offsets(clocks)?;
+            self.apply_rm_domain_vf_offsets(clocks)?;
             self.apply_rm_propagation(clocks)?;
             self.apply_rm_rail_limits(clocks)?;
             self.apply_rm_rail_current_limits(clocks)?;

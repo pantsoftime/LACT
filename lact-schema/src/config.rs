@@ -133,6 +133,13 @@ pub struct ClocksConfiguration {
     /// fan / thermal policies follow it.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty", with = "thermal_inputs_serde")]
     pub thermal_inputs: IndexMap<u8, i32>,
+    /// NVIDIA-only (this fork): per-point frequency offsets, MHz, on the V/F
+    /// curves of the non-core clock domains — domain name ("XBARCLK",
+    /// "SYSCLK", "VIDCLK") → point index within the curve → offset. They add to
+    /// the domain's global clock offset. A domain absent from the map, or a
+    /// point absent from a domain, is written back to zero.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty", with = "domain_vf_offsets_serde")]
+    pub domain_vf_offsets: IndexMap<String, IndexMap<u8, i32>>,
 }
 
 impl ClocksConfiguration {
@@ -374,6 +381,39 @@ mod tests {
     }
 }
 
+/// `domain_vf_offsets` on the wire: the inner point maps use decimal string
+/// keys, for the same reason as `thermal_inputs`.
+mod domain_vf_offsets_serde {
+    use indexmap::IndexMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(map: &IndexMap<String, IndexMap<u8, i32>>, s: S) -> Result<S::Ok, S::Error> {
+        let by_string: IndexMap<&String, IndexMap<String, i32>> = map
+            .iter()
+            .map(|(domain, points)| (domain, points.iter().map(|(k, v)| (k.to_string(), *v)).collect()))
+            .collect();
+        by_string.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<IndexMap<String, IndexMap<u8, i32>>, D::Error> {
+        let by_string: IndexMap<String, IndexMap<String, i32>> = IndexMap::deserialize(d)?;
+        by_string
+            .into_iter()
+            .map(|(domain, points)| {
+                let points = points
+                    .into_iter()
+                    .map(|(k, v)| {
+                        k.parse::<u8>()
+                            .map(|k| (k, v))
+                            .map_err(|_| serde::de::Error::custom(format!("curve point key {k:?} is not a point index")))
+                    })
+                    .collect::<Result<IndexMap<u8, i32>, D::Error>>()?;
+                Ok((domain, points))
+            })
+            .collect()
+    }
+}
+
 /// `thermal_inputs` on the wire: JSON map keys are strings, and serde_json
 /// does not turn them back into `u8` for us, so the map is written and read
 /// with decimal string keys ("1": 40).
@@ -413,5 +453,18 @@ mod thermal_inputs_tests {
         assert_eq!(back.thermal_inputs.get(&1), Some(&40));
         let none: ClocksConfiguration = serde_json::from_str("{}").unwrap();
         assert!(none.thermal_inputs.is_empty());
+    }
+
+    #[test]
+    fn domain_vf_offsets_round_trip_json_string_keys() {
+        let mut c = ClocksConfiguration::default();
+        c.domain_vf_offsets
+            .entry("XBARCLK".to_owned())
+            .or_default()
+            .insert(63, -15);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"domain_vf_offsets\":{\"XBARCLK\":{\"63\":-15}}"), "{json}");
+        let back: ClocksConfiguration = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.domain_vf_offsets["XBARCLK"].get(&63), Some(&-15));
     }
 }

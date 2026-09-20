@@ -399,3 +399,30 @@ the system daemon shows them and the GUI's embedded daemon does not — one
 register per call, and refuses the decode unless tRC = tRAS + tRP holds on
 the broadcast word (it does in both P-states here: 84 = 56 + 28 loaded,
 9 = 6 + 3 idle). Read-only; the table changes with the memory P-state.
+
+## Editing the fabric V/F curves (2026-09-20)
+
+mVolt+ v0.47.1 added editing of the XBAR, SYS and video V/F curves on Windows. The fork had
+those curves read-only because on driver 610 point writes were unconfirmed and one domain
+dropped a written point. A probe on 615 (tooling `rm_probe_vfpoints.py`) showed the opposite:
+`CLK_VF_POINTS` GET_CONTROL (`0x20809023`, 0x1020c) holds one 16-byte record per point from
++0x108 — point type first, a per-point frequency delta (i32 kHz) at +8, all zero without
+edits, the domain's global offset living elsewhere — and SET_CONTROL (`0x2080d024`) with only
+the changed points in the 640-bit mask was kept on every later read, moved exactly that point
+in GET_STATUS and none of its neighbours, and restored cleanly, on all three domains.
+
+**Daemon** (`nvidia/rm_vf.rs`, `write_bank_offsets`): per curve, the configured offsets are
+compared with the control block and only changed points are selected and written; the control
+block must then hold exactly the request or the pre-write records are put back and the apply
+fails; the status frequencies are compared with the pre-write curve and a point that did not
+move by its delta is logged (the driver keeps curves monotonic, so that is a warning). Range
+−1000…+300 MHz per point. XBAR, SYS and video only: the core curve keeps upstream's editor,
+PWRCLK follows XBAR through the ratio. Profile field `domain_vf_offsets: {domain: {point: MHz}}`;
+an absent domain or point is written back to zero, so a reset or a profile without the field
+clears the card.
+
+**GUI**: the row under the chart picks a curve, a voltage range and an offset — *Set offset on
+range*, *Flatten above From*, *Clear curve*, *Discard* — and the chart draws the curve as it
+would be with the staged offsets. Range-based on purpose: the use is holding a fabric clock down
+over the voltage region where the harness finds errors while keeping the global offset that
+passes elsewhere.

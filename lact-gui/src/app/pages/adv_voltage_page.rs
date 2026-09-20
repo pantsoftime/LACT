@@ -1188,6 +1188,9 @@ const CURVE_COLOURS: [(f64, f64, f64); 6] = [
     (0.90, 0.30, 0.30),
 ];
 
+/// Per-domain, per-point offsets, MHz: domain name → point index → offset.
+type CurveOffsets = indexmap::IndexMap<String, indexmap::IndexMap<u8, i32>>;
+
 struct CurveChart {
     frame: gtk::Frame,
     area: gtk::DrawingArea,
@@ -1195,6 +1198,84 @@ struct CurveChart {
     readout: gtk::Label,
     curves: Rc<RefCell<Vec<NvidiaDomainVfCurve>>>,
     enabled: Rc<RefCell<Vec<bool>>>,
+    /// The offsets the editor wants: what the card holds until the user
+    /// stages a change, then the staged state until Apply or Discard.
+    pending: Rc<RefCell<CurveOffsets>>,
+    dirty: Rc<Cell<bool>>,
+    editor: Rc<CurveEditor>,
+}
+
+/// The range editor under the chart: pick an editable curve, a voltage
+/// range and an offset. Deliberately range-based rather than point-dragging:
+/// the use is holding a fabric clock down (or up) over the voltage region
+/// where it misbehaves, which is a range operation.
+struct CurveEditor {
+    row: gtk::Box,
+    domain: gtk::DropDown,
+    from_mv: gtk::SpinButton,
+    to_mv: gtk::SpinButton,
+    offset: gtk::SpinButton,
+    summary: gtk::Label,
+    names: RefCell<Vec<String>>,
+}
+
+impl CurveEditor {
+    fn selected(&self) -> Option<String> {
+        self.names.borrow().get(self.domain.selected() as usize).cloned()
+    }
+}
+
+/// The curves as they would look with the pending offsets applied: an
+/// editable curve's frequency is its reported one minus the offset the card
+/// holds plus the pending offset.
+fn effective_curves(curves: &[NvidiaDomainVfCurve], pending: &CurveOffsets) -> Vec<NvidiaDomainVfCurve> {
+    curves
+        .iter()
+        .map(|c| {
+            let mut c = c.clone();
+            if c.editable {
+                let want = pending.get(&c.domain);
+                for (i, p) in c.points.iter_mut().enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let target = want.and_then(|m| m.get(&(i as u8))).copied().unwrap_or(0);
+                    let freq = i64::from(p.freq_mhz) - i64::from(p.offset_mhz) + i64::from(target);
+                    p.freq_mhz = u32::try_from(freq.max(0)).unwrap_or(0);
+                    p.offset_mhz = target;
+                }
+            }
+            c
+        })
+        .collect()
+}
+
+fn offsets_summary(curves: &[NvidiaDomainVfCurve], pending: &CurveOffsets, dirty: bool) -> String {
+    let mut parts = Vec::new();
+    for c in curves.iter().filter(|c| c.editable) {
+        let Some(points) = pending.get(&c.domain).filter(|m| m.values().any(|v| *v != 0)) else {
+            continue;
+        };
+        let edited: Vec<(u32, i32)> = points
+            .iter()
+            .filter(|(_, v)| **v != 0)
+            .filter_map(|(i, v)| c.points.get(usize::from(*i)).map(|p| (p.voltage_mv, *v)))
+            .collect();
+        let (lo, hi) = (
+            edited.iter().map(|e| e.0).min().unwrap_or(0),
+            edited.iter().map(|e| e.0).max().unwrap_or(0),
+        );
+        let (omin, omax) = (
+            edited.iter().map(|e| e.1).min().unwrap_or(0),
+            edited.iter().map(|e| e.1).max().unwrap_or(0),
+        );
+        let span = if omin == omax { format!("{omin:+} MHz") } else { format!("{omin:+}…{omax:+} MHz") };
+        parts.push(format!("{}: {} points, {lo}–{hi} mV, {span}", c.domain, edited.len()));
+    }
+    let state = if dirty { "Staged (Apply to write)" } else { "On the card" };
+    if parts.is_empty() {
+        format!("{state}: no per-point offsets")
+    } else {
+        format!("{state}: {}", parts.join("   ·   "))
+    }
 }
 
 impl CurveChart {
@@ -1203,9 +1284,12 @@ impl CurveChart {
     const MARGIN_T: f64 = 10.0;
     const MARGIN_B: f64 = 30.0;
 
-    fn new() -> Self {
+    fn new(on_edit: impl Fn() + 'static) -> Self {
+        let on_edit: Rc<dyn Fn()> = Rc::new(on_edit);
         let curves: Rc<RefCell<Vec<NvidiaDomainVfCurve>>> = Rc::new(RefCell::new(Vec::new()));
         let enabled: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let pending: Rc<RefCell<CurveOffsets>> = Rc::new(RefCell::new(CurveOffsets::new()));
+        let dirty = Rc::new(Cell::new(false));
         let hover: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
         let area = gtk::DrawingArea::builder()
             .content_height(260)
@@ -1216,21 +1300,23 @@ impl CurveChart {
         readout.set_max_width_chars(-1);
         let legend = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         {
-            let (curves, enabled, hover) = (curves.clone(), enabled.clone(), hover.clone());
+            let (curves, enabled, hover, pending) = (curves.clone(), enabled.clone(), hover.clone(), pending.clone());
             area.set_draw_func(move |_, cr, w, h| {
-                Self::draw(cr, f64::from(w), f64::from(h), &curves.borrow(), &enabled.borrow(), hover.get());
+                let shown = effective_curves(&curves.borrow(), &pending.borrow());
+                Self::draw(cr, f64::from(w), f64::from(h), &shown, &enabled.borrow(), hover.get());
             });
         }
         {
             let motion = gtk::EventControllerMotion::new();
             {
-                let (hover, area2, readout, curves, enabled) =
-                    (hover.clone(), area.clone(), readout.clone(), curves.clone(), enabled.clone());
+                let (hover, area2, readout, curves, enabled, pending) =
+                    (hover.clone(), area.clone(), readout.clone(), curves.clone(), enabled.clone(), pending.clone());
                 motion.connect_motion(move |_, x, y| {
                     hover.set(Some((x, y)));
                     let w = f64::from(area2.width());
                     let h = f64::from(area2.height());
-                    readout.set_label(&Self::nearest(x, y, w, h, &curves.borrow(), &enabled.borrow()));
+                    let shown = effective_curves(&curves.borrow(), &pending.borrow());
+                    readout.set_label(&Self::nearest(x, y, w, h, &shown, &enabled.borrow()));
                     area2.queue_draw();
                 });
             }
@@ -1243,11 +1329,155 @@ impl CurveChart {
             }
             area.add_controller(motion);
         }
+        // ---- the range editor
+        let domain = gtk::DropDown::from_strings(&[]);
+        domain.set_tooltip_text(Some("The curve to edit: XBAR, SYS and video accept per-point offsets"));
+        let spin = |lo: f64, hi: f64, step: f64, tip: &str| {
+            let s = gtk::SpinButton::with_range(lo, hi, step);
+            s.set_width_chars(5);
+            s.set_tooltip_text(Some(tip));
+            s
+        };
+        let from_mv = spin(0.0, 2000.0, 5.0, "First voltage of the range, mV (snaps to the nearest curve point)");
+        let to_mv = spin(0.0, 2000.0, 5.0, "Last voltage of the range, mV");
+        let offset = spin(-1000.0, 300.0, 5.0, "Frequency offset for every point in the range, MHz; adds to the domain's global clock offset. Negative = slower at those voltages (the safe direction).");
+        let set_button = gtk::Button::builder()
+            .label("Set offset on range")
+            .tooltip_text("Stage the offset on every curve point between From and To (replaces, does not add)")
+            .build();
+        let flatten_button = gtk::Button::builder()
+            .label("Flatten above From")
+            .tooltip_text("Stage offsets that hold every point above From at From's frequency — the fabric equivalent of the core undervolt flatten")
+            .build();
+        let clear_button = gtk::Button::builder()
+            .label("Clear curve")
+            .css_classes(["flat"])
+            .tooltip_text("Stage zero offsets for the selected curve")
+            .build();
+        let discard_button = gtk::Button::builder()
+            .label("Discard")
+            .css_classes(["flat"])
+            .tooltip_text("Drop the staged edits and show what the card holds")
+            .build();
+        let summary = caption("On the card: no per-point offsets", false);
+        summary.set_width_chars(-1);
+        summary.set_max_width_chars(-1);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        for w in [
+            gtk::Label::new(Some("Edit")).upcast::<gtk::Widget>(),
+            domain.clone().upcast(),
+            gtk::Label::new(Some("From")).upcast(),
+            from_mv.clone().upcast(),
+            gtk::Label::new(Some("to")).upcast(),
+            to_mv.clone().upcast(),
+            gtk::Label::new(Some("mV   offset")).upcast(),
+            offset.clone().upcast(),
+            gtk::Label::new(Some("MHz")).upcast(),
+            set_button.clone().upcast(),
+            flatten_button.clone().upcast(),
+            clear_button.clone().upcast(),
+            discard_button.clone().upcast(),
+        ] {
+            row.append(&w);
+        }
+        let editor = Rc::new(CurveEditor {
+            row,
+            domain,
+            from_mv,
+            to_mv,
+            offset,
+            summary,
+            names: RefCell::new(Vec::new()),
+        });
+
+        // One closure applies an edit to the selected curve's pending map.
+        let stage = {
+            let (curves, pending, dirty, editor, area, on_edit) =
+                (curves.clone(), pending.clone(), dirty.clone(), editor.clone(), area.clone(), on_edit.clone());
+            Rc::new(move |edit: &dyn Fn(&NvidiaDomainVfCurve, &mut indexmap::IndexMap<u8, i32>)| {
+                let Some(name) = editor.selected() else { return };
+                let curves_ref = curves.borrow();
+                let Some(curve) = curves_ref.iter().find(|c| c.domain == name && c.editable) else {
+                    return;
+                };
+                {
+                    let mut pending = pending.borrow_mut();
+                    let points = pending.entry(name.clone()).or_default();
+                    edit(curve, points);
+                    points.retain(|_, v| *v != 0);
+                    if points.is_empty() {
+                        pending.shift_remove(&name);
+                    }
+                }
+                dirty.set(true);
+                editor.summary.set_label(&offsets_summary(&curves_ref, &pending.borrow(), true));
+                area.queue_draw();
+                on_edit();
+            })
+        };
+        {
+            let (stage, editor) = (stage.clone(), editor.clone());
+            set_button.connect_clicked(move |_| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let (lo, hi) = (editor.from_mv.value() as u32, editor.to_mv.value() as u32);
+                let (lo, hi) = (lo.min(hi), lo.max(hi));
+                #[allow(clippy::cast_possible_truncation)]
+                let mhz = editor.offset.value() as i32;
+                stage(&|curve, points| {
+                    let mhz = mhz.clamp(curve.offset_min_mhz, curve.offset_max_mhz);
+                    for (i, p) in curve.points.iter().enumerate() {
+                        if (lo..=hi).contains(&p.voltage_mv) {
+                            #[allow(clippy::cast_possible_truncation)]
+                            points.insert(i as u8, mhz);
+                        }
+                    }
+                });
+            });
+        }
+        {
+            let (stage, editor) = (stage.clone(), editor.clone());
+            flatten_button.connect_clicked(move |_| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let from = editor.from_mv.value() as u32;
+                stage(&|curve, points| {
+                    let Some(k) = curve.points.iter().position(|p| p.voltage_mv >= from) else {
+                        return;
+                    };
+                    // Frequencies without any per-point offset, then the target.
+                    let base = |i: usize| i64::from(curve.points[i].freq_mhz) - i64::from(curve.points[i].offset_mhz);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let target = base(k) + i64::from(points.get(&(k as u8)).copied().unwrap_or(0));
+                    for i in k + 1..curve.points.len() {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let want = (target - base(i)).clamp(i64::from(curve.offset_min_mhz), i64::from(curve.offset_max_mhz)) as i32;
+                        #[allow(clippy::cast_possible_truncation)]
+                        points.insert(i as u8, want);
+                    }
+                });
+            });
+        }
+        {
+            let stage = stage.clone();
+            clear_button.connect_clicked(move |_| stage(&|_, points| points.clear()));
+        }
+        {
+            let (curves, pending, dirty, editor, area) =
+                (curves.clone(), pending.clone(), dirty.clone(), editor.clone(), area.clone());
+            discard_button.connect_clicked(move |_| {
+                *pending.borrow_mut() = applied_offsets(&curves.borrow());
+                dirty.set(false);
+                editor.summary.set_label(&offsets_summary(&curves.borrow(), &pending.borrow(), false));
+                area.queue_draw();
+            });
+        }
+
         let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
         body.set_margin_all(8);
         body.append(&legend);
         body.append(&area);
         body.append(&readout);
+        body.append(&editor.row);
+        body.append(&editor.summary);
         let frame = gtk::Frame::builder().child(&body).build();
         Self {
             frame,
@@ -1256,7 +1486,19 @@ impl CurveChart {
             readout,
             curves,
             enabled,
+            pending,
+            dirty,
+            editor,
         }
+    }
+
+    /// Write the staged offsets into the pending config on Apply.
+    fn apply(&self, config: &mut GpuConfig) {
+        if !self.dirty.get() {
+            return;
+        }
+        config.clocks_configuration.domain_vf_offsets = self.pending.borrow().clone();
+        self.dirty.set(false);
     }
 
     fn set(&self, curves: &[NvidiaDomainVfCurve]) {
@@ -1265,6 +1507,31 @@ impl CurveChart {
             current.len() != curves.len() || current.iter().zip(curves).any(|(a, b)| a.domain != b.domain)
         };
         *self.curves.borrow_mut() = curves.to_vec();
+        // Until the user stages something the editor mirrors the card.
+        if !self.dirty.get() {
+            *self.pending.borrow_mut() = applied_offsets(curves);
+        }
+        self.editor
+            .summary
+            .set_label(&offsets_summary(curves, &self.pending.borrow(), self.dirty.get()));
+        let editable: Vec<String> = curves.iter().filter(|c| c.editable).map(|c| c.domain.clone()).collect();
+        if *self.editor.names.borrow() != editable {
+            let items: Vec<&str> = editable.iter().map(String::as_str).collect();
+            self.editor.domain.set_model(Some(&gtk::StringList::new(&items)));
+            *self.editor.names.borrow_mut() = editable.clone();
+            if let Some(c) = curves.iter().find(|c| c.editable)
+                && let (Some(first), Some(last)) = (c.points.first(), c.points.last())
+            {
+                for s in [&self.editor.from_mv, &self.editor.to_mv] {
+                    s.set_range(f64::from(first.voltage_mv), f64::from(last.voltage_mv));
+                }
+                self.editor.from_mv.set_value(f64::from(first.voltage_mv));
+                self.editor.to_mv.set_value(f64::from(last.voltage_mv));
+                self.editor.offset.set_range(f64::from(c.offset_min_mhz), f64::from(c.offset_max_mhz));
+                self.editor.offset.set_value(0.0);
+            }
+        }
+        self.editor.row.set_sensitive(!editable.is_empty());
         if names_changed {
             while let Some(child) = self.legend.first_child() {
                 self.legend.remove(&child);
@@ -1977,17 +2244,26 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
 
         // ---- Clock domain V/F curves, read-only
         let curves_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let curves_title = section_label("Clock domain V/F curves (read-only)");
+        let curves_title = section_label("Clock domain V/F curves");
         curves_title.set_hexpand(true);
         curves_header.append(&curves_title);
         curves_header.append(&info_icon(
-            "The 127-point voltage/frequency curve of every clock domain that keeps one, as the driver \
-             reports it (RM CLK_VF_POINTS). XBAR, SYS, video and PWRCLK sit on the MSVDD rail; GPC is on \
-             NVVDD and has its own editor on the Overclocking page. The clock and voltage offsets above \
-             shift these curves, which is how their effect can be seen; untick a curve to rescale the rest.\n\n\
-             Read-only on purpose: the driver accepts writes to these points but gives no way to verify \
-             they were adopted, and one domain silently drops a written point on the next read. Hover to \
-             read a point; the readout picks the nearest point on both axes.",
+            "What it is: the 127-point voltage/frequency curve of every clock domain that keeps one, as the driver \
+             reports it (RM CLK_VF_POINTS). XBAR, SYS, video and PWRCLK sit on the MSVDD rail; GPC is on NVVDD. \
+             The row under the chart stages per-point frequency offsets on the XBAR, SYS and video curves; the \
+             core curve has its own editor (Edit GPC curve…) and PWRCLK follows XBAR through the ratio.\n\
+             Effect: a per-point offset adds to the domain's global clock offset at that voltage only. Negative \
+             holds the clock down in a voltage region (the safe direction); positive raises it there. Flatten \
+             above pins every higher-voltage point to one frequency, the fabric version of the core undervolt.\n\
+             Use: the fabric fails silently above its stable clock, so shape the curve instead of lowering the \
+             whole offset — keep the global offset that passes at low voltage and pull down only the region \
+             where the harness errors. Validate with the Tests section after every change.\n\
+             Observed on this card (driver 615): single-point writes of −15 MHz on XBAR, SYS and video were kept \
+             by the driver on every later read, moved exactly that point by 15 MHz and none of its neighbours, and \
+             restored cleanly. On driver 610 another tester saw a domain drop a written point, so the daemon \
+             verifies both the stored offset and the resulting curve and rolls back if the driver kept something else.\n\
+             Risk: positive offsets on a fabric curve are where silent corruption lives; the daemon caps them at +300 MHz. \
+             Untick a curve to rescale the rest; hover reads the nearest point.",
             false,
         ));
         let open_editor = gtk::Button::builder()
@@ -2007,7 +2283,12 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
         }
         curves_header.append(&open_editor);
         content.append(&curves_header);
-        let curves = CurveChart::new();
+        let curves = CurveChart::new({
+            let sender = sender.clone();
+            move || {
+                let _ = sender.output(AppMsg::SettingsChanged);
+            }
+        });
         content.append(&curves.frame);
 
         // ---- Boot guard: the fallback switch for everything above
@@ -2442,6 +2723,7 @@ impl AdvVoltagePage {
         for (_, card) in self.thermal_cards.borrow().iter() {
             card.apply(config);
         }
+        self.curves.apply(config);
     }
 
     /// Rebuild the thermal-input cards when the sensor set changes, then
@@ -2533,6 +2815,28 @@ fn thermal_caption(s: &NvidiaThermalSensor) -> String {
         (true, None) => format!("Reading {reading}   simulated"),
         _ => format!("Reading {reading}   measuring"),
     }
+}
+
+/// The per-point offsets the card holds, from the table's curves.
+fn applied_offsets(curves: &[NvidiaDomainVfCurve]) -> CurveOffsets {
+    let mut out = CurveOffsets::new();
+    for c in curves.iter().filter(|c| c.editable) {
+        let points: indexmap::IndexMap<u8, i32> = c
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.offset_mhz != 0)
+            .map(|(i, p)| {
+                #[allow(clippy::cast_possible_truncation)]
+                let i = i as u8;
+                (i, p.offset_mhz)
+            })
+            .collect();
+        if !points.is_empty() {
+            out.insert(c.domain.clone(), points);
+        }
+    }
+    out
 }
 
 /// The OCP card caption; `live_a` overrides the table's snapshot reading.

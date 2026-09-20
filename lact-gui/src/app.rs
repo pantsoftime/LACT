@@ -121,6 +121,8 @@ pub struct AppModel {
     info_page: relm4::Controller<InformationPage>,
     oc_page: relm4::Controller<OcPage>,
     adv_voltage_page: relm4::Controller<AdvVoltagePage>,
+    // Held so the page component stays alive; its widget lives in the navigation list.
+    #[allow(dead_code)]
     wireview_page: relm4::Controller<WireViewPage>,
     thermals_page: relm4::Controller<ThermalsPage>,
     software_page: relm4::Controller<SoftwarePage>,
