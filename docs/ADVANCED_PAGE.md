@@ -434,3 +434,10 @@ A −15 MHz regional write on core point 60 behaved exactly like the fabric ones
 1305 MHz, neighbours unmoved, clean restore), so GPC is in the editor's pulldown with the same
 stacking semantics as the others, independent of upstream's editor rather than competing for the
 same values.
+
+**Mouse and keys on the chart.** Click selects the nearest point of the curve being edited,
+Shift+click extends the range (shown as a band); ↑ / ↓ nudge the range by 5 MHz relative to what
+each point already has (Shift 1, Ctrl 25); ← / → move the range along the curve (Shift extends
+it); Delete clears the range; Ctrl+Z undoes staged edits (50 steps). The summary line shows the
+per-point offset and the effective one with the domain's global offset, since the two stack.
+Nothing is written until Apply.

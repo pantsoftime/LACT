@@ -1307,6 +1307,10 @@ impl CurveChart {
         let enabled: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
         let pending: Rc<RefCell<CurveOffsets>> = Rc::new(RefCell::new(CurveOffsets::new()));
         let dirty = Rc::new(Cell::new(false));
+        // The editor's From..To range in mV, mirrored here for the draw function.
+        let selection: Rc<Cell<Option<(u32, u32)>>> = Rc::new(Cell::new(None));
+        // Snapshots of `pending` before each staged edit, for Ctrl+Z.
+        let undo: Rc<RefCell<Vec<CurveOffsets>>> = Rc::new(RefCell::new(Vec::new()));
         let globals: Rc<RefCell<std::collections::HashMap<String, i32>>> = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let hover: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
         let area = gtk::DrawingArea::builder()
@@ -1319,9 +1323,19 @@ impl CurveChart {
         let legend = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         {
             let (curves, enabled, hover, pending) = (curves.clone(), enabled.clone(), hover.clone(), pending.clone());
+            let selection = selection.clone();
             area.set_draw_func(move |_, cr, w, h| {
                 let shown = effective_curves(&curves.borrow(), &pending.borrow());
-                Self::draw(cr, f64::from(w), f64::from(h), &shown, &enabled.borrow(), hover.get());
+                let (w, h) = (f64::from(w), f64::from(h));
+                // The editor's voltage range, as a band behind the curves.
+                if let (Some((lo, hi)), Some(r)) = (selection.get(), Self::ranges(&shown, &enabled.borrow())) {
+                    let (x0, _) = Self::project(f64::from(lo), 0.0, w, h, r);
+                    let (x1, _) = Self::project(f64::from(hi), 0.0, w, h, r);
+                    cr.set_source_rgba(0.5, 0.6, 0.9, 0.18);
+                    cr.rectangle(x0.min(x1) - 2.0, Self::MARGIN_T, (x1 - x0).abs() + 4.0, h - Self::MARGIN_T - Self::MARGIN_B);
+                    let _ = cr.fill();
+                }
+                Self::draw(cr, w, h, &shown, &enabled.borrow(), hover.get());
             });
         }
         {
@@ -1410,7 +1424,7 @@ impl CurveChart {
 
         // One closure applies an edit to the selected curve's pending map.
         let stage = {
-            let (curves, pending, dirty, editor, area, on_edit, globals) = (
+            let (curves, pending, dirty, editor, area, on_edit, globals, undo) = (
                 curves.clone(),
                 pending.clone(),
                 dirty.clone(),
@@ -1418,6 +1432,7 @@ impl CurveChart {
                 area.clone(),
                 on_edit.clone(),
                 globals.clone(),
+                undo.clone(),
             );
             Rc::new(move |edit: &dyn Fn(&NvidiaDomainVfCurve, &mut indexmap::IndexMap<u8, i32>)| {
                 let Some(name) = editor.selected() else { return };
@@ -1427,6 +1442,13 @@ impl CurveChart {
                 };
                 {
                     let mut pending = pending.borrow_mut();
+                    {
+                        let mut undo = undo.borrow_mut();
+                        undo.push(pending.clone());
+                        if undo.len() > 50 {
+                            undo.remove(0);
+                        }
+                    }
                     let points = pending.entry(name.clone()).or_default();
                     edit(curve, points);
                     points.retain(|_, v| *v != 0);
@@ -1510,12 +1532,178 @@ impl CurveChart {
             });
         }
 
+        // ---- mouse and keyboard on the chart
+        // Click sets the range to the nearest point of the selected curve,
+        // Shift+click extends it; the chart takes focus so the keys work.
+        area.set_focusable(true);
+        {
+            let sync = {
+                let (editor, selection, area) = (editor.clone(), selection.clone(), area.clone());
+                move || {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let (a, b) = (editor.from_mv.value() as u32, editor.to_mv.value() as u32);
+                    selection.set(Some((a.min(b), a.max(b))));
+                    area.queue_draw();
+                }
+            };
+            let s1 = sync.clone();
+            editor.from_mv.connect_value_changed(move |_| s1());
+            let s2 = sync.clone();
+            editor.to_mv.connect_value_changed(move |_| s2());
+        }
+        {
+            let click = gtk::GestureClick::new();
+            let (curves, enabled, pending, editor, area2) =
+                (curves.clone(), enabled.clone(), pending.clone(), editor.clone(), area.clone());
+            click.connect_pressed(move |gesture, _, x, _| {
+                area2.grab_focus();
+                let shown = effective_curves(&curves.borrow(), &pending.borrow());
+                let Some((v_min, v_max, _)) = Self::ranges(&shown, &enabled.borrow()) else {
+                    return;
+                };
+                let w = f64::from(area2.width());
+                let span = w - Self::MARGIN_L - Self::MARGIN_R;
+                if span <= 0.0 {
+                    return;
+                }
+                let mv = v_min + ((x - Self::MARGIN_L) / span).clamp(0.0, 1.0) * (v_max - v_min);
+                let name = editor.selected();
+                let snapped = shown
+                    .iter()
+                    .find(|c| c.editable && Some(&c.domain) == name.as_ref())
+                    .and_then(|c| {
+                        c.points
+                            .iter()
+                            .min_by(|a, b| {
+                                (f64::from(a.voltage_mv) - mv)
+                                    .abs()
+                                    .total_cmp(&(f64::from(b.voltage_mv) - mv).abs())
+                            })
+                            .map(|p| f64::from(p.voltage_mv))
+                    });
+                let Some(v) = snapped else { return };
+                if gesture.current_event_state().contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                    editor.to_mv.set_value(v);
+                } else {
+                    editor.from_mv.set_value(v);
+                    editor.to_mv.set_value(v);
+                }
+            });
+            area.add_controller(click);
+        }
+        {
+            let keys = gtk::EventControllerKey::new();
+            let (stage, editor, undo, pending, dirty, curves, area2, globals, on_edit) = (
+                stage.clone(),
+                editor.clone(),
+                undo.clone(),
+                pending.clone(),
+                dirty.clone(),
+                curves.clone(),
+                area.clone(),
+                globals.clone(),
+                on_edit.clone(),
+            );
+            keys.connect_key_pressed(move |_, key, _, state| {
+                use gtk::gdk::{Key, ModifierType};
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let (a, b) = (editor.from_mv.value() as u32, editor.to_mv.value() as u32);
+                let (lo, hi) = (a.min(b), a.max(b));
+                let step = if state.contains(ModifierType::CONTROL_MASK) {
+                    25
+                } else if state.contains(ModifierType::SHIFT_MASK) {
+                    1
+                } else {
+                    5
+                };
+                match key {
+                    // Nudge the range: relative to what each point already has.
+                    Key::Up | Key::Down => {
+                        let delta = if key == Key::Up { step } else { -step };
+                        stage(&|curve, points| {
+                            for (i, p) in curve.points.iter().enumerate() {
+                                if (lo..=hi).contains(&p.voltage_mv) {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let i = i as u8;
+                                    let now = points.get(&i).copied().unwrap_or(0);
+                                    points.insert(i, (now + delta).clamp(curve.offset_min_mhz, curve.offset_max_mhz));
+                                }
+                            }
+                        });
+                        gtk::glib::Propagation::Stop
+                    }
+                    // Move the whole range along the curve.
+                    Key::Left | Key::Right => {
+                        let name = editor.selected();
+                        let curves_ref = curves.borrow();
+                        if let Some(c) = curves_ref.iter().find(|c| c.editable && Some(&c.domain) == name.as_ref()) {
+                            let volts: Vec<u32> = c.points.iter().map(|p| p.voltage_mv).collect();
+                            let at = |v: u32| volts.iter().position(|x| *x >= v).unwrap_or(volts.len().saturating_sub(1));
+                            let (i, j) = (at(lo), at(hi));
+                            let shift = |k: usize| {
+                                if key == Key::Right {
+                                    (k + 1).min(volts.len() - 1)
+                                } else {
+                                    k.saturating_sub(1)
+                                }
+                            };
+                            if !volts.is_empty() {
+                                if state.contains(ModifierType::SHIFT_MASK) {
+                                    editor.to_mv.set_value(f64::from(volts[shift(j)]));
+                                } else {
+                                    editor.from_mv.set_value(f64::from(volts[shift(i)]));
+                                    editor.to_mv.set_value(f64::from(volts[shift(j)]));
+                                }
+                            }
+                        }
+                        gtk::glib::Propagation::Stop
+                    }
+                    Key::Delete | Key::BackSpace => {
+                        stage(&|curve, points| {
+                            for (i, p) in curve.points.iter().enumerate() {
+                                if (lo..=hi).contains(&p.voltage_mv) {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    points.shift_remove(&(i as u8));
+                                }
+                            }
+                        });
+                        gtk::glib::Propagation::Stop
+                    }
+                    Key::z | Key::Z if state.contains(ModifierType::CONTROL_MASK) => {
+                        if let Some(previous) = undo.borrow_mut().pop() {
+                            let applied = applied_offsets(&curves.borrow());
+                            dirty.set(previous != applied);
+                            *pending.borrow_mut() = previous;
+                            editor.summary.set_label(&offsets_summary(
+                                &curves.borrow(),
+                                &pending.borrow(),
+                                dirty.get(),
+                                &globals.borrow(),
+                            ));
+                            area2.queue_draw();
+                            on_edit();
+                        }
+                        gtk::glib::Propagation::Stop
+                    }
+                    _ => gtk::glib::Propagation::Proceed,
+                }
+            });
+            area.add_controller(keys);
+        }
+        let keys_help = caption(
+            "Chart: click selects a point, Shift+click extends the range · ↑/↓ nudge 5 MHz (Shift 1, Ctrl 25) · ←/→ move the range (Shift extends) · Delete clears it · Ctrl+Z undo",
+            false,
+        );
+        keys_help.set_width_chars(-1);
+        keys_help.set_max_width_chars(-1);
+
         let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
         body.set_margin_all(8);
         body.append(&legend);
         body.append(&area);
         body.append(&readout);
         body.append(&editor.row);
+        body.append(&keys_help);
         body.append(&editor.summary);
         let frame = gtk::Frame::builder().child(&body).build();
         Self {
