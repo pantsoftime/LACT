@@ -1349,7 +1349,7 @@ impl CurveChart {
         }
         // ---- the range editor
         let domain = gtk::DropDown::from_strings(&[]);
-        domain.set_tooltip_text(Some("The curve to edit: XBAR, SYS and video accept per-point offsets"));
+        domain.set_tooltip_text(Some("The curve to edit: GPC, XBAR, SYS and video accept per-point offsets"));
         let spin = |lo: f64, hi: f64, step: f64, tip: &str| {
             let s = gtk::SpinButton::with_range(lo, hi, step);
             s.set_width_chars(5);
@@ -2304,15 +2304,17 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
         curves_header.append(&info_icon(
             "What it is: the 127-point voltage/frequency curve of every clock domain that keeps one, as the driver \
              reports it (RM CLK_VF_POINTS). XBAR, SYS, video and PWRCLK sit on the MSVDD rail; GPC is on NVVDD. \
-             The row under the chart stages per-point frequency offsets on the XBAR, SYS and video curves; the \
-             core curve has its own editor (Edit GPC curve…) and PWRCLK follows XBAR through the ratio.\n\
+             The row under the chart stages per-point frequency offsets on the GPC, XBAR, SYS and video curves; \
+             PWRCLK follows XBAR through the ratio. For GPC these offsets are a second layer: the core clock \
+             offset and the separate GPC editor (Edit GPC curve…) write absolute per-point values underneath, and \
+             what is staged here stacks on top of them.\n\
              Effect: a per-point offset adds to the domain's global clock offset at that voltage only. Negative \
              holds the clock down in a voltage region (the safe direction); positive raises it there. Flatten \
              above pins every higher-voltage point to one frequency, the fabric version of the core undervolt.\n\
              Use: the fabric fails silently above its stable clock, so shape the curve instead of lowering the \
              whole offset — keep the global offset that passes at low voltage and pull down only the region \
              where the harness errors. Validate with the Tests section after every change.\n\
-             Observed on this card (driver 615): single-point writes of −15 MHz on XBAR, SYS and video were kept \
+             Observed on this card (driver 615): single-point writes of −15 MHz on GPC, XBAR, SYS and video were kept \
              by the driver on every later read, moved exactly that point by 15 MHz and none of its neighbours, and \
              restored cleanly. On driver 610 another tester saw a domain drop a written point, so the daemon \
              verifies both the stored offset and the resulting curve and rolls back if the driver kept something else.\n\

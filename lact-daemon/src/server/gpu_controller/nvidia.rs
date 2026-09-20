@@ -1719,11 +1719,17 @@ impl NvidiaGpuController {
     }
 
     /// Every domain's V/F curve, named and tagged with its rail (display only).
-    /// The curves this fork writes: the fabric-side domains whose per-point
-    /// writes were verified (XBAR, SYS, video). The core curve has upstream's
-    /// own editor; PWRCLK follows XBAR through the propagation ratio.
+    /// The curves this fork writes: the domains whose per-point writes on the
+    /// regional layer were verified on R615 (GPC, XBAR, SYS, video). PWRCLK
+    /// follows XBAR through the propagation ratio. For GPC this is a second
+    /// layer: the NVML core offset and upstream's curve editor live in the
+    /// client layer (absolute per-point values), and these offsets stack on
+    /// top of whatever that layer holds.
     fn domain_curve_editable(domain: &RmClockDomain) -> bool {
-        matches!(domain.kind, Some(RmDomainKind::Xbar | RmDomainKind::Sys | RmDomainKind::Video))
+        matches!(
+            domain.kind,
+            Some(RmDomainKind::Gpc | RmDomainKind::Xbar | RmDomainKind::Sys | RmDomainKind::Video)
+        )
     }
 
     /// Apply the configured per-point curve offsets; a domain absent from

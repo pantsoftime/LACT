@@ -426,3 +426,11 @@ range*, *Flatten above From*, *Clear curve*, *Discard* — and the chart draws t
 would be with the staged offsets. Range-based on purpose: the use is holding a fabric clock down
 over the voltage region where the harness finds errors while keeping the global offset that
 passes elsewhere.
+
+**GPC too (same day).** The core curve has two layers: the *client* layer holds the NVML core
+offset as the same value on all 127 points and is what upstream's core editor writes, as
+absolute per-point values; the *regional* layer used above is separate and all zeros by default.
+A −15 MHz regional write on core point 60 behaved exactly like the fabric ones (kept, 1320 →
+1305 MHz, neighbours unmoved, clean restore), so GPC is in the editor's pulldown with the same
+stacking semantics as the others, independent of upstream's editor rather than competing for the
+same values.
