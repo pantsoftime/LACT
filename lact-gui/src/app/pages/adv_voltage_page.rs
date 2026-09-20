@@ -1204,6 +1204,7 @@ struct CurveChart {
     dirty: Rc<Cell<bool>>,
     editor: Rc<CurveEditor>,
     selection: Rc<Cell<Option<(u32, u32)>>>,
+    undo: Rc<RefCell<Vec<CurveOffsets>>>,
     /// Each domain's global clock offset, MHz, so the summary can show the
     /// effective offset (global + per-point) and not just the per-point part.
     globals: Rc<RefCell<std::collections::HashMap<String, i32>>>,
@@ -1819,6 +1820,7 @@ impl CurveChart {
             dirty,
             editor,
             selection,
+            undo,
             globals,
         }
     }
@@ -1832,6 +1834,21 @@ impl CurveChart {
             self.dirty.get(),
             &self.globals.borrow(),
         ));
+    }
+
+    /// Drop staged curve edits, the undo history and the selection; the next
+    /// `set` reloads what the card holds.
+    fn discard_staged(&self) {
+        self.dirty.set(false);
+        self.undo.borrow_mut().clear();
+        self.selection.set(None);
+        let name = self.editor.selected();
+        self.editor.reset_boxes(
+            self.curves
+                .borrow()
+                .iter()
+                .find(|c| c.editable && Some(&c.domain) == name.as_ref()),
+        );
     }
 
     /// Write the staged offsets into the pending config on Apply.
@@ -2710,6 +2727,12 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
                     Some(ClocksTable::Nvidia(table)) => Some(table),
                     _ => None,
                 };
+                // A table only arrives on a reload — startup, Apply, Revert, a
+                // profile switch — and the app drops its pending-changes flag at
+                // the same moment. Staged edits on this page must go with it,
+                // or a touched card keeps its old target and hides what the
+                // newly loaded profile holds.
+                self.discard_staged();
                 self.show_table(table.as_ref());
                 self.table = table;
             }
@@ -3063,6 +3086,9 @@ impl AdvVoltagePage {
             &self.msvdd,
             &self.sys,
             &self.video,
+            &self.sys_volt,
+            &self.video_volt,
+            &self.ratio,
             &self.mem,
             &self.power,
             &self.nvvdd_ocp,
@@ -3076,6 +3102,35 @@ impl AdvVoltagePage {
             card.apply(config);
         }
         self.curves.apply(config);
+    }
+
+    /// Forget every staged edit on the page (see the `ClocksTable` handler).
+    fn discard_staged(&self) {
+        for card in [
+            &self.core,
+            &self.boost_lock,
+            &self.vboost,
+            &self.nvvdd,
+            &self.xbar,
+            &self.msvdd,
+            &self.sys,
+            &self.video,
+            &self.sys_volt,
+            &self.video_volt,
+            &self.ratio,
+            &self.mem,
+            &self.power,
+            &self.nvvdd_ocp,
+            &self.msvdd_ocp,
+        ] {
+            card.dirty.set(false);
+        }
+        self.nvvdd_rail.dirty.set(false);
+        self.msvdd_rail.dirty.set(false);
+        for (_, card) in self.thermal_cards.borrow().iter() {
+            card.dirty.set(false);
+        }
+        self.curves.discard_staged();
     }
 
     /// Rebuild the thermal-input cards when the sensor set changes, then
