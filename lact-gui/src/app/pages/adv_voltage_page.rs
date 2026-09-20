@@ -1203,6 +1203,7 @@ struct CurveChart {
     pending: Rc<RefCell<CurveOffsets>>,
     dirty: Rc<Cell<bool>>,
     editor: Rc<CurveEditor>,
+    selection: Rc<Cell<Option<(u32, u32)>>>,
     /// Each domain's global clock offset, MHz, so the summary can show the
     /// effective offset (global + per-point) and not just the per-point part.
     globals: Rc<RefCell<std::collections::HashMap<String, i32>>>,
@@ -1220,9 +1221,43 @@ struct CurveEditor {
     offset: gtk::SpinButton,
     summary: gtk::Label,
     names: RefCell<Vec<String>>,
+    /// The user has picked a range (clicked the chart or edited From / To).
+    /// Until then nothing can be staged: the boxes start at the curve's full
+    /// span, and staging on a range nobody chose is how a whole curve gets
+    /// shifted by accident.
+    has_selection: Cell<bool>,
+    /// Set while the boxes are filled programmatically.
+    loading: Cell<bool>,
 }
 
 impl CurveEditor {
+    /// From / To in mV, ordered, if a range has been chosen.
+    fn range(&self) -> Option<(u32, u32)> {
+        if !self.has_selection.get() {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (a, b) = (self.from_mv.value() as u32, self.to_mv.value() as u32);
+        Some((a.min(b), a.max(b)))
+    }
+
+    /// Put the boxes back to "nothing chosen" for a curve.
+    fn reset_boxes(&self, curve: Option<&NvidiaDomainVfCurve>) {
+        self.loading.set(true);
+        if let Some(c) = curve
+            && let (Some(first), Some(last)) = (c.points.first(), c.points.last())
+        {
+            self.from_mv.set_range(f64::from(first.voltage_mv), f64::from(last.voltage_mv));
+            self.to_mv.set_range(f64::from(first.voltage_mv), f64::from(last.voltage_mv));
+            self.from_mv.set_value(f64::from(first.voltage_mv));
+            self.to_mv.set_value(f64::from(last.voltage_mv));
+            self.offset.set_range(f64::from(c.offset_min_mhz), f64::from(c.offset_max_mhz));
+        }
+        self.offset.set_value(0.0);
+        self.has_selection.set(false);
+        self.loading.set(false);
+    }
+
     fn selected(&self) -> Option<String> {
         self.names.borrow().get(self.domain.selected() as usize).cloned()
     }
@@ -1420,6 +1455,8 @@ impl CurveChart {
             offset,
             summary,
             names: RefCell::new(Vec::new()),
+            has_selection: Cell::new(false),
+            loading: Cell::new(false),
         });
 
         // One closure applies an edit to the selected curve's pending map.
@@ -1467,9 +1504,10 @@ impl CurveChart {
         {
             let (stage, editor) = (stage.clone(), editor.clone());
             set_button.connect_clicked(move |_| {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let (lo, hi) = (editor.from_mv.value() as u32, editor.to_mv.value() as u32);
-                let (lo, hi) = (lo.min(hi), lo.max(hi));
+                let Some((lo, hi)) = editor.range() else {
+                    editor.summary.set_label("Select a range first: click a point on the chart (Shift+click extends), or edit From / To");
+                    return;
+                };
                 #[allow(clippy::cast_possible_truncation)]
                 let mhz = editor.offset.value() as i32;
                 stage(&|curve, points| {
@@ -1486,8 +1524,10 @@ impl CurveChart {
         {
             let (stage, editor) = (stage.clone(), editor.clone());
             flatten_button.connect_clicked(move |_| {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let from = editor.from_mv.value() as u32;
+                let Some((from, _)) = editor.range() else {
+                    editor.summary.set_label("Select the point to flatten from first: click it on the chart");
+                    return;
+                };
                 stage(&|curve, points| {
                     let Some(k) = curve.points.iter().position(|p| p.voltage_mv >= from) else {
                         return;
@@ -1510,24 +1550,35 @@ impl CurveChart {
             clear_button.connect_clicked(move |_| stage(&|_, points| points.clear()));
         }
         {
-            let (curves, pending, dirty, editor, area, globals) =
-                (curves.clone(), pending.clone(), dirty.clone(), editor.clone(), area.clone(), globals.clone());
+            let (curves, pending, dirty, editor, area, globals, selection) = (
+                curves.clone(),
+                pending.clone(),
+                dirty.clone(),
+                editor.clone(),
+                area.clone(),
+                globals.clone(),
+                selection.clone(),
+            );
             discard_button.connect_clicked(move |_| {
                 *pending.borrow_mut() = applied_offsets(&curves.borrow());
                 dirty.set(false);
                 editor
                     .summary
                     .set_label(&offsets_summary(&curves.borrow(), &pending.borrow(), false, &globals.borrow()));
-                // Also put the entry boxes back: the selected curve's full
-                // voltage range and a zero offset.
+                // Also put the entry boxes back and drop the selection.
                 let name = editor.selected();
-                if let Some(c) = curves.borrow().iter().find(|c| c.editable && Some(&c.domain) == name.as_ref())
-                    && let (Some(first), Some(last)) = (c.points.first(), c.points.last())
-                {
-                    editor.from_mv.set_value(f64::from(first.voltage_mv));
-                    editor.to_mv.set_value(f64::from(last.voltage_mv));
-                }
-                editor.offset.set_value(0.0);
+                editor.reset_boxes(curves.borrow().iter().find(|c| c.editable && Some(&c.domain) == name.as_ref()));
+                selection.set(None);
+                area.queue_draw();
+            });
+        }
+
+        {
+            let (editor2, curves, selection, area) = (editor.clone(), curves.clone(), selection.clone(), area.clone());
+            editor.domain.connect_selected_notify(move |_| {
+                let name = editor2.selected();
+                editor2.reset_boxes(curves.borrow().iter().find(|c| c.editable && Some(&c.domain) == name.as_ref()));
+                selection.set(None);
                 area.queue_draw();
             });
         }
@@ -1540,9 +1591,12 @@ impl CurveChart {
             let sync = {
                 let (editor, selection, area) = (editor.clone(), selection.clone(), area.clone());
                 move || {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let (a, b) = (editor.from_mv.value() as u32, editor.to_mv.value() as u32);
-                    selection.set(Some((a.min(b), a.max(b))));
+                    if editor.loading.get() {
+                        return;
+                    }
+                    // Editing From / To by hand is choosing a range.
+                    editor.has_selection.set(true);
+                    selection.set(editor.range());
                     area.queue_draw();
                 }
             };
@@ -1552,9 +1606,37 @@ impl CurveChart {
             editor.to_mv.connect_value_changed(move |_| s2());
         }
         {
+            // The offset box is live: its value is staged, absolute, on the
+            // chosen range, so "select, type, Apply" works and cannot double.
+            let (stage, editor2) = (stage.clone(), editor.clone());
+            editor.offset.connect_value_changed(move |spin| {
+                if editor2.loading.get() {
+                    return;
+                }
+                let Some((lo, hi)) = editor2.range() else { return };
+                #[allow(clippy::cast_possible_truncation)]
+                let mhz = spin.value() as i32;
+                stage(&|curve, points| {
+                    let mhz = mhz.clamp(curve.offset_min_mhz, curve.offset_max_mhz);
+                    for (i, p) in curve.points.iter().enumerate() {
+                        if (lo..=hi).contains(&p.voltage_mv) {
+                            #[allow(clippy::cast_possible_truncation)]
+                            points.insert(i as u8, mhz);
+                        }
+                    }
+                });
+            });
+        }
+        {
             let click = gtk::GestureClick::new();
-            let (curves, enabled, pending, editor, area2) =
-                (curves.clone(), enabled.clone(), pending.clone(), editor.clone(), area.clone());
+            let (curves, enabled, pending, editor, area2, selection) = (
+                curves.clone(),
+                enabled.clone(),
+                pending.clone(),
+                editor.clone(),
+                area.clone(),
+                selection.clone(),
+            );
             click.connect_pressed(move |gesture, _, x, _| {
                 area2.grab_focus();
                 let shown = effective_curves(&curves.borrow(), &pending.borrow());
@@ -1582,12 +1664,28 @@ impl CurveChart {
                             .map(|p| f64::from(p.voltage_mv))
                     });
                 let Some(v) = snapped else { return };
-                if gesture.current_event_state().contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                let extend = gesture.current_event_state().contains(gtk::gdk::ModifierType::SHIFT_MASK)
+                    && editor.has_selection.get();
+                editor.loading.set(true);
+                if extend {
                     editor.to_mv.set_value(v);
                 } else {
+                    // A plain click (or Shift+click with nothing selected yet)
+                    // selects just that point and shows what it holds.
                     editor.from_mv.set_value(v);
                     editor.to_mv.set_value(v);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let held = shown
+                        .iter()
+                        .find(|c| c.editable && Some(&c.domain) == name.as_ref())
+                        .and_then(|c| c.points.iter().find(|p| p.voltage_mv == v as u32))
+                        .map_or(0, |p| p.offset_mhz);
+                    editor.offset.set_value(f64::from(held));
                 }
+                editor.has_selection.set(true);
+                editor.loading.set(false);
+                selection.set(editor.range());
+                area2.queue_draw();
             });
             area.add_controller(click);
         }
@@ -1606,9 +1704,13 @@ impl CurveChart {
             );
             keys.connect_key_pressed(move |_, key, _, state| {
                 use gtk::gdk::{Key, ModifierType};
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let (a, b) = (editor.from_mv.value() as u32, editor.to_mv.value() as u32);
-                let (lo, hi) = (a.min(b), a.max(b));
+                let is_undo = matches!(key, Key::z | Key::Z) && state.contains(ModifierType::CONTROL_MASK);
+                // Nothing selected: only undo makes sense.
+                let (lo, hi) = match editor.range() {
+                    Some(range) => range,
+                    None if is_undo => (0, 0),
+                    None => return gtk::glib::Propagation::Proceed,
+                };
                 let step = if state.contains(ModifierType::CONTROL_MASK) {
                     25
                 } else if state.contains(ModifierType::SHIFT_MASK) {
@@ -1691,7 +1793,7 @@ impl CurveChart {
             area.add_controller(keys);
         }
         let keys_help = caption(
-            "Chart: click selects a point, Shift+click extends the range · ↑/↓ nudge 5 MHz (Shift 1, Ctrl 25) · ←/→ move the range (Shift extends) · Delete clears it · Ctrl+Z undo",
+            "Click a point to select it, Shift+click to extend the range; the offset box sets that range (absolute) · ↑/↓ nudge it by 5 MHz (Shift 1, Ctrl 25; adds to what is there) · ←/→ move the range (Shift extends) · Delete clears it · Ctrl+Z undo · nothing is written until Apply",
             false,
         );
         keys_help.set_width_chars(-1);
@@ -1716,6 +1818,7 @@ impl CurveChart {
             pending,
             dirty,
             editor,
+            selection,
             globals,
         }
     }
@@ -1761,17 +1864,8 @@ impl CurveChart {
             let items: Vec<&str> = editable.iter().map(String::as_str).collect();
             self.editor.domain.set_model(Some(&gtk::StringList::new(&items)));
             *self.editor.names.borrow_mut() = editable.clone();
-            if let Some(c) = curves.iter().find(|c| c.editable)
-                && let (Some(first), Some(last)) = (c.points.first(), c.points.last())
-            {
-                for s in [&self.editor.from_mv, &self.editor.to_mv] {
-                    s.set_range(f64::from(first.voltage_mv), f64::from(last.voltage_mv));
-                }
-                self.editor.from_mv.set_value(f64::from(first.voltage_mv));
-                self.editor.to_mv.set_value(f64::from(last.voltage_mv));
-                self.editor.offset.set_range(f64::from(c.offset_min_mhz), f64::from(c.offset_max_mhz));
-                self.editor.offset.set_value(0.0);
-            }
+            self.editor.reset_boxes(curves.iter().find(|c| c.editable));
+            self.selection.set(None);
         }
         self.editor.row.set_sensitive(!editable.is_empty());
         if names_changed {
