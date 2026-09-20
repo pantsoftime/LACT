@@ -1203,6 +1203,9 @@ struct CurveChart {
     pending: Rc<RefCell<CurveOffsets>>,
     dirty: Rc<Cell<bool>>,
     editor: Rc<CurveEditor>,
+    /// Each domain's global clock offset, MHz, so the summary can show the
+    /// effective offset (global + per-point) and not just the per-point part.
+    globals: Rc<RefCell<std::collections::HashMap<String, i32>>>,
 }
 
 /// The range editor under the chart: pick an editable curve, a voltage
@@ -1248,7 +1251,12 @@ fn effective_curves(curves: &[NvidiaDomainVfCurve], pending: &CurveOffsets) -> V
         .collect()
 }
 
-fn offsets_summary(curves: &[NvidiaDomainVfCurve], pending: &CurveOffsets, dirty: bool) -> String {
+fn offsets_summary(
+    curves: &[NvidiaDomainVfCurve],
+    pending: &CurveOffsets,
+    dirty: bool,
+    globals: &std::collections::HashMap<String, i32>,
+) -> String {
     let mut parts = Vec::new();
     for c in curves.iter().filter(|c| c.editable) {
         let Some(points) = pending.get(&c.domain).filter(|m| m.values().any(|v| *v != 0)) else {
@@ -1267,8 +1275,17 @@ fn offsets_summary(curves: &[NvidiaDomainVfCurve], pending: &CurveOffsets, dirty
             edited.iter().map(|e| e.1).min().unwrap_or(0),
             edited.iter().map(|e| e.1).max().unwrap_or(0),
         );
-        let span = if omin == omax { format!("{omin:+} MHz") } else { format!("{omin:+}…{omax:+} MHz") };
-        parts.push(format!("{}: {} points, {lo}–{hi} mV, {span}", c.domain, edited.len()));
+        let span = |a: i32, b: i32| if a == b { format!("{a:+} MHz") } else { format!("{a:+}…{b:+} MHz") };
+        // Per-point offsets stack on the domain's global offset: show both.
+        let effective = globals.get(&c.domain).map_or(String::new(), |g| {
+            format!(" → effective {} with the {g:+} global", span(omin + g, omax + g))
+        });
+        parts.push(format!(
+            "{}: {} points, {lo}–{hi} mV, per-point {}{effective}",
+            c.domain,
+            edited.len(),
+            span(omin, omax)
+        ));
     }
     let state = if dirty { "Staged (Apply to write)" } else { "On the card" };
     if parts.is_empty() {
@@ -1290,6 +1307,7 @@ impl CurveChart {
         let enabled: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
         let pending: Rc<RefCell<CurveOffsets>> = Rc::new(RefCell::new(CurveOffsets::new()));
         let dirty = Rc::new(Cell::new(false));
+        let globals: Rc<RefCell<std::collections::HashMap<String, i32>>> = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let hover: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
         let area = gtk::DrawingArea::builder()
             .content_height(260)
@@ -1392,8 +1410,15 @@ impl CurveChart {
 
         // One closure applies an edit to the selected curve's pending map.
         let stage = {
-            let (curves, pending, dirty, editor, area, on_edit) =
-                (curves.clone(), pending.clone(), dirty.clone(), editor.clone(), area.clone(), on_edit.clone());
+            let (curves, pending, dirty, editor, area, on_edit, globals) = (
+                curves.clone(),
+                pending.clone(),
+                dirty.clone(),
+                editor.clone(),
+                area.clone(),
+                on_edit.clone(),
+                globals.clone(),
+            );
             Rc::new(move |edit: &dyn Fn(&NvidiaDomainVfCurve, &mut indexmap::IndexMap<u8, i32>)| {
                 let Some(name) = editor.selected() else { return };
                 let curves_ref = curves.borrow();
@@ -1410,7 +1435,9 @@ impl CurveChart {
                     }
                 }
                 dirty.set(true);
-                editor.summary.set_label(&offsets_summary(&curves_ref, &pending.borrow(), true));
+                editor
+                    .summary
+                    .set_label(&offsets_summary(&curves_ref, &pending.borrow(), true, &globals.borrow()));
                 area.queue_draw();
                 on_edit();
             })
@@ -1461,12 +1488,24 @@ impl CurveChart {
             clear_button.connect_clicked(move |_| stage(&|_, points| points.clear()));
         }
         {
-            let (curves, pending, dirty, editor, area) =
-                (curves.clone(), pending.clone(), dirty.clone(), editor.clone(), area.clone());
+            let (curves, pending, dirty, editor, area, globals) =
+                (curves.clone(), pending.clone(), dirty.clone(), editor.clone(), area.clone(), globals.clone());
             discard_button.connect_clicked(move |_| {
                 *pending.borrow_mut() = applied_offsets(&curves.borrow());
                 dirty.set(false);
-                editor.summary.set_label(&offsets_summary(&curves.borrow(), &pending.borrow(), false));
+                editor
+                    .summary
+                    .set_label(&offsets_summary(&curves.borrow(), &pending.borrow(), false, &globals.borrow()));
+                // Also put the entry boxes back: the selected curve's full
+                // voltage range and a zero offset.
+                let name = editor.selected();
+                if let Some(c) = curves.borrow().iter().find(|c| c.editable && Some(&c.domain) == name.as_ref())
+                    && let (Some(first), Some(last)) = (c.points.first(), c.points.last())
+                {
+                    editor.from_mv.set_value(f64::from(first.voltage_mv));
+                    editor.to_mv.set_value(f64::from(last.voltage_mv));
+                }
+                editor.offset.set_value(0.0);
                 area.queue_draw();
             });
         }
@@ -1489,7 +1528,19 @@ impl CurveChart {
             pending,
             dirty,
             editor,
+            globals,
         }
+    }
+
+    /// The domains' global clock offsets, MHz, for the summary line.
+    fn set_globals(&self, globals: std::collections::HashMap<String, i32>) {
+        *self.globals.borrow_mut() = globals;
+        self.editor.summary.set_label(&offsets_summary(
+            &self.curves.borrow(),
+            &self.pending.borrow(),
+            self.dirty.get(),
+            &self.globals.borrow(),
+        ));
     }
 
     /// Write the staged offsets into the pending config on Apply.
@@ -1511,9 +1562,12 @@ impl CurveChart {
         if !self.dirty.get() {
             *self.pending.borrow_mut() = applied_offsets(curves);
         }
-        self.editor
-            .summary
-            .set_label(&offsets_summary(curves, &self.pending.borrow(), self.dirty.get()));
+        self.editor.summary.set_label(&offsets_summary(
+            curves,
+            &self.pending.borrow(),
+            self.dirty.get(),
+            &self.globals.borrow(),
+        ));
         let editable: Vec<String> = curves.iter().filter(|c| c.editable).map(|c| c.domain.clone()).collect();
         if *self.editor.names.borrow() != editable {
             let items: Vec<&str> = editable.iter().map(String::as_str).collect();
@@ -2576,6 +2630,20 @@ impl AdvVoltagePage {
             return;
         };
         self.curves.set(&t.domain_vf_curves);
+        let mut globals = std::collections::HashMap::new();
+        for (name, offset) in [
+            ("XBARCLK", t.xbar_offset.as_ref()),
+            ("SYSCLK", t.sys_offset.as_ref()),
+            ("VIDCLK", t.video_offset.as_ref()),
+        ] {
+            if let Some(o) = offset {
+                globals.insert(name.to_owned(), o.current);
+            }
+        }
+        if let Some(o) = t.gpu_offsets.get(&0).or_else(|| t.gpu_offsets.values().next()) {
+            globals.insert("GPCCLK".to_owned(), o.current);
+        }
+        self.curves.set_globals(globals);
 
         match t.gpc_xbar_ratio {
             Some(r) => self.ratio.load(
