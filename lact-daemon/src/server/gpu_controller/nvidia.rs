@@ -1998,7 +1998,15 @@ impl GpuController for NvidiaGpuController {
         .collect::<IndexMap<String, u64>>();
         // RM-measured domains NVML does not report; the graphs window plots
         // every entry of this map, so this is what makes XBAR graphable.
-        for (name, kind) in [("XBAR", RmDomainKind::Xbar), ("SYS", RmDomainKind::Sys)] {
+        // PWRCLK/HUBCLK are named after the RM domains so they sit apart from
+        // the NvAPI "Power"/"HUB" entries below, which have read differently
+        // (NvAPI Power 892 MHz vs RM PWRCLK ~1910 MHz at the same idle).
+        for (name, kind) in [
+            ("XBAR", RmDomainKind::Xbar),
+            ("SYS", RmDomainKind::Sys),
+            ("PWRCLK", RmDomainKind::Pwr),
+            ("HUBCLK", RmDomainKind::Hub),
+        ] {
             if let Some(mhz) = self.rm_measure_mhz(kind) {
                 extra_clocks.insert(name.to_owned(), mhz);
             }
