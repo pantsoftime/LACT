@@ -180,6 +180,15 @@ own `linuxvolt.json`. Buttons:
 - **Rebuild baseline** — two stock runs plus the probe reference; refuses
   unless every RM offset is 0 and 4 GiB of VRAM is free.
 - **Steady load (2 min)** — the duty-cycled load the clock probes use.
+- **Torch bench** (2026-09-21) — `ab_torch_kernels.py`: a 32B-class decoder
+  run token by token against a KV cache (LLM decode, bandwidth-bound) then a
+  batched prefill pass (compute); 10 s warm-up + 30 s timed per phase. The
+  status line reads the JSON result out as tok/s, GB/s and TFLOPS.
+- **FurMark bench** (2026-09-21) — the gaming-style raster load. Runs
+  `furmark_cmd` from `linuxvolt.json` if set, otherwise FurMark 2's 1440p
+  OpenGL preset benchmark (60 s, windowed) when `furmark` is on `PATH`; the
+  button is greyed out when neither exists. The status line reads out SCORE
+  and min/avg/max FPS.
 - **Driver check** — the read-only half of the post-driver-update checklist.
 
 Each run is a shell pipeline in its own process group (Stop ends all of it),

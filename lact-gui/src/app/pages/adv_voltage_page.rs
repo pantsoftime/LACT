@@ -512,13 +512,35 @@ impl TestRunner {
             })
     }
 
-    /// The torch venv the harness needs, from the tooling's own config.
-    fn venv(tools_dir: &std::path::Path) -> String {
+    /// A string field of the tooling's own config (`linuxvolt.json`).
+    fn config_str(tools_dir: &std::path::Path, key: &str) -> Option<String> {
         fs::read_to_string(tools_dir.join("linuxvolt.json"))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| v.get("venv_python")?.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "python3".to_owned())
+            .and_then(|v| v.get(key)?.as_str().map(str::to_owned))
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// The torch venv the harness needs, from the tooling's own config.
+    fn venv(tools_dir: &std::path::Path) -> String {
+        Self::config_str(tools_dir, "venv_python").unwrap_or_else(|| "python3".to_owned())
+    }
+
+    /// The gaming-style load: `furmark_cmd` from the tooling config if set,
+    /// else FurMark 2's own 1440p GL preset benchmark when the binary is
+    /// installed. Its stdout carries the SCORE and FPS lines the status
+    /// line reads out.
+    fn furmark_cmd(tools_dir: &std::path::Path) -> Option<String> {
+        Self::config_str(tools_dir, "furmark_cmd").or_else(|| {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .any(|dir| dir.join("furmark").is_file())
+                    .then(|| {
+                        "furmark --demo furmark-gl --p1440 --benchmark --no-score-box --print-render-speed"
+                            .to_owned()
+                    })
+            })
+        })
     }
 
     fn new() -> (Self, gtk::Frame) {
@@ -588,37 +610,63 @@ impl TestRunner {
             child: Rc::new(RefCell::new(None)),
         };
         let v = format!("'{}'", runner.venv);
-        let tests: [(&str, &str, String); 4] = [
+        let furmark = Self::furmark_cmd(&runner.tools_dir);
+        let tests: [(&str, &str, String, bool); 6] = [
             (
                 "Correctness check",
                 "Runs the harness at the setting that is applied right now and compares it bit for bit \
                  with the stock baseline (stock_a.json). ~2.5 min at ~400 W. MATCH or SILENT CORRUPTION.",
                 format!("{v} xbar_verify.py run --out gui_check.json && {v} xbar_verify.py compare stock_a.json gui_check.json"),
+                available,
             ),
             (
                 "Rebuild baseline",
                 "Two stock runs plus the probe reference (~6 min). Refuses unless every RM offset is 0 \
                  and 4 GiB of VRAM is free — turn XBAR off and apply first.",
                 format!("VENV_PYTHON={v} sh rebuild_baseline.sh"),
+                available,
             ),
             (
                 "Steady load (2 min)",
                 "Duty-cycled matmul + memory sweep that keeps the card in P0 below the power cap; \
                  what the clock probes and the ratio A/B were measured under.",
                 format!("{v} steady_load.py --seconds 120"),
+                available,
+            ),
+            (
+                "Torch bench",
+                "Throughput, not correctness: a 32B-class decoder run token by token against a KV cache \
+                 (LLM decode — bandwidth-bound, the path XBAR sits on) then a batched prefill pass (compute). \
+                 10 s warm-up + 30 s timed per phase, ~1.5 min total at ~500 W; fills most of the free VRAM, so \
+                 close other GPU work first. The status line reads out tok/s, GB/s and TFLOPS; compare runs \
+                 at different settings, single runs drift a few percent with temperature.",
+                format!("{v} ab_torch_kernels.py --duration 30 --warmup 10"),
+                available,
+            ),
+            (
+                "FurMark bench",
+                "Gaming-style load: FurMark 2's built-in 1440p OpenGL preset, 60 s, windowed. Raster, not \
+                 compute, so it exercises the display/raster path the torch tests do not and it is the closest \
+                 thing to the 3DMark and game-FPS numbers the forum results are quoted in. The status line reads \
+                 out the SCORE and min/avg/max FPS. Override the command with `furmark_cmd` in the tooling's \
+                 linuxvolt.json (e.g. a Vulkan demo, another preset, or a game launcher). Idle here on this card \
+                 is ~240 FPS at 720p — a run at low FPS with the card near idle power has not loaded the GPU.",
+                furmark.clone().unwrap_or_default(),
+                furmark.is_some(),
             ),
             (
                 "Driver check",
                 "The read-only half of the post-driver-update checklist: snapshot the RM surface, \
                  diff it against the previous driver, measure, correlate.",
                 "sh after_driver_update.sh".to_owned(),
+                available,
             ),
         ];
-        for (label, tip, cmd) in tests {
+        for (label, tip, cmd, enabled) in tests {
             let button = gtk::Button::builder()
                 .label(label)
                 .tooltip_text(tip)
-                .sensitive(available)
+                .sensitive(enabled)
                 .build();
             let (name, cmd, r) = (label.to_owned(), cmd.clone(), runner.handles());
             button.connect_clicked(move |_| r.start(&name, &cmd));
@@ -715,13 +763,15 @@ impl TestRunner {
             }
             Ok(Some(code)) => {
                 let verdict = if text.contains("SILENT CORRUPTION") {
-                    "SILENT CORRUPTION — the applied setting computes wrong results"
+                    "SILENT CORRUPTION — the applied setting computes wrong results".to_owned()
                 } else if text.contains("MATCH") {
-                    "MATCH — bit-identical to the stock baseline"
+                    "MATCH — bit-identical to the stock baseline".to_owned()
+                } else if let Some(summary) = bench_summary(&text) {
+                    summary
                 } else if code.success() {
-                    "finished"
+                    "finished".to_owned()
                 } else {
-                    "failed"
+                    "failed".to_owned()
                 };
                 self.status.set_label(&format!(
                     "{name}: {verdict}   ({elapsed} s, exit {}, log {})",
@@ -744,6 +794,37 @@ impl TestRunner {
         }
         self.stop.set_sensitive(false);
         gtk::glib::ControlFlow::Break
+    }
+}
+
+/// One-line read-out of a benchmark log: the torch kernel bench prints a
+/// single JSON line; FurMark prints `- SCORE : n` and `- FPS (min/avg/max) : a / b / c`.
+fn bench_summary(text: &str) -> Option<String> {
+    if let Some(json) = text
+        .lines()
+        .rev()
+        .find(|l| l.starts_with('{'))
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    {
+        let f = |k: &str| json.get(k).and_then(serde_json::Value::as_f64);
+        if let (Some(tok), Some(gbps), Some(tflops)) =
+            (f("decode_tok_s"), f("decode_gbps"), f("prefill_tflops"))
+        {
+            return Some(format!(
+                "decode {tok:.1} tok/s ({gbps:.0} GB/s), prefill {tflops:.1} TFLOPS"
+            ));
+        }
+    }
+    let field = |key: &str| {
+        text.lines()
+            .find(|l| l.trim_start().starts_with("- ") && l.contains(key))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_owned())
+    };
+    match (field("SCORE"), field("FPS (min/avg/max)")) {
+        (Some(score), Some(fps)) => Some(format!("SCORE {score}, FPS min/avg/max {fps}")),
+        (Some(score), None) => Some(format!("SCORE {score}")),
+        _ => None,
     }
 }
 
@@ -2664,10 +2745,11 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             header.append(&section_label("Tests"));
             header.append(&info_icon(
-                "The private tooling's validation harness, run from here with the currently applied settings. Use: \
-                 after any change to a fabric offset or ratio, because fabric errors are silent — a run that produces \
-                 a different result digest, or lower throughput, is a failed setting even if nothing crashed. The \
-                 output is the script's own; the tooling directory and Python come from the tooling's config.",
+                "The private tooling's validation harness and two throughput benchmarks, run from here with the \
+                 currently applied settings. Use: after any change to a fabric offset or ratio run the correctness \
+                 check, because fabric errors are silent — a different result digest is a failed setting even if \
+                 nothing crashed; then the torch and FurMark benches say what the setting is worth (compute/bandwidth \
+                 vs raster). The output is the script's own; the tooling directory and Python come from the tooling's config.",
                 false,
             ));
             content.append(&header);
