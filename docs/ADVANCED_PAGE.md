@@ -224,7 +224,13 @@ and restore the preimage on mismatch; reset returns the start values. The
 "NVVDD rail" / "MSVDD rail" tiles show the policies' live readings and the
 power they imply at the rail target, published as the `NVVDD` / `MSVDD`
 current sensors (amps, graphable as "Current (…)") and the `NVVDD rail` /
-`MSVDD rail` power sensors (watts).
+`MSVDD rail` power sensors (watts). The "PWRCLK" and "HUB" tiles (and the
+matching `PWRCLK` / `HUBCLK` clock sensors in the graphs window) are
+RM-measured, read-only clocks: the driver reports an offset range of 0 for
+both, and a probe on 2026-09-21 showed a −15 MHz request is stored and
+ignored, idle and under load. PWRCLK is the PMU clock and follows XBAR
+through the propagation ratio; HUB sits at ~540 MHz. NvAPI's own "Power" and
+"HUB" clock entries remain but read differently from RM at idle.
 
 Cost: the boost-limit sweep (two 84 KB requests, ~27 ms) and the 400 KB
 power-policy STATUS (~6 ms) are the two expensive RM reads; the daemon

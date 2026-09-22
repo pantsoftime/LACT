@@ -2066,6 +2066,8 @@ pub struct AdvVoltagePage {
     tele_power: gtk::Label,
     tele_nvvdd_rail: gtk::Label,
     tele_msvdd_rail: gtk::Label,
+    tele_pwrclk: gtk::Label,
+    tele_hub: gtk::Label,
 
     core: Card,
     boost_lock: Card,
@@ -2147,14 +2149,14 @@ impl relm4::Component for AdvVoltagePage {
         let tele = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .min_children_per_line(4)
-            .max_children_per_line(11)
+            .max_children_per_line(13)
             .homogeneous(true)
             .row_spacing(6)
             .column_spacing(8)
             .hexpand(true)
             .build();
         let mut tiles = Vec::new();
-        let specs: [(&str, Vec<StatType>); 11] = [
+        let specs: [(&str, Vec<StatType>); 13] = [
             ("GPC", vec![StatType::GpuClock]),
             ("XBAR", vec![StatType::Clockspeed("XBAR".into())]),
             ("SYS", vec![StatType::Clockspeed("SYS".into())]),
@@ -2184,6 +2186,11 @@ impl relm4::Component for AdvVoltagePage {
             // ("Power (NVVDD rail)") is graphable from the graphs window.
             ("NVVDD rail", vec![StatType::Current("NVVDD".into())]),
             ("MSVDD rail", vec![StatType::Current("MSVDD".into())]),
+            // RM-measured; the driver permits no offset on either (range 0,
+            // writes are stored and ignored — probed 2026-09-21). PWRCLK is
+            // the PMU clock and tracks XBAR through the propagation ratio.
+            ("PWRCLK", vec![StatType::Clockspeed("PWRCLK".into())]),
+            ("HUB", vec![StatType::Clockspeed("HUBCLK".into())]),
         ];
         for (name, stats) in specs {
             let (tile, label) = tele_tile(name, stats, &sender);
@@ -2205,6 +2212,7 @@ impl relm4::Component for AdvVoltagePage {
             tiles.next().unwrap(),
         );
         let (tele_nvvdd_rail, tele_msvdd_rail) = (tiles.next().unwrap(), tiles.next().unwrap());
+        let (tele_pwrclk, tele_hub) = (tiles.next().unwrap(), tiles.next().unwrap());
         content.append(&tele);
 
         // ---- Core / NVVDD
@@ -2681,6 +2689,8 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
             tele_power,
             tele_nvvdd_rail,
             tele_msvdd_rail,
+            tele_pwrclk,
+            tele_hub,
             core,
             boost_lock,
             vboost,
@@ -2750,6 +2760,8 @@ impl AdvVoltagePage {
         self.tele_sys.set_label(&mhz(c.sys_clockspeed));
         self.tele_video.set_label(&mhz(c.video_clockspeed));
         self.tele_mem.set_label(&mhz(c.vram_clockspeed));
+        self.tele_pwrclk.set_label(&mhz(c.sensors.get("PWRCLK").copied()));
+        self.tele_hub.set_label(&mhz(c.sensors.get("HUBCLK").copied()));
 
         let ratio = match (c.xbar_clockspeed, c.gpu_clockspeed) {
             (Some(x), Some(g)) if g > 0 => format!("{:.3}", x as f64 / g as f64),
