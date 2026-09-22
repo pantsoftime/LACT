@@ -7,7 +7,11 @@
 set -e
 cd "$(dirname "$0")"
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
-[ -x target/release/lact ] || { echo "no release binary; run: cargo build --release"; exit 1; }
+[ -x target/release/lact ] || { echo "no release binary; run: cargo build -p lact --release"; exit 1; }
+# Building a single crate (-p lact-gui / -p lact-daemon) refreshes only its
+# rlib; `make install` copies target/release/lact, which then goes out stale.
+stale=$(find lact-*/src -name '*.rs' -newer target/release/lact | head -1)
+[ -z "$stale" ] || { echo "release binary is older than $stale; run: cargo build -p lact --release"; exit 1; }
 
 echo "== stopping any running lact daemon =="
 systemctl stop lactd 2>/dev/null || true
