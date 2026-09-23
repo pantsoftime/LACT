@@ -770,8 +770,8 @@ impl TestRunner {
                 // Programs writing to a file block-buffer stdout, so their whole
                 // output can land between the read above and the exit being
                 // seen (FurMark does exactly that): read the log once more.
-                // Lossy: FurMark writes its degree sign as a lone Latin-1 byte,
-                // which made a strict UTF-8 read drop the whole log.
+                // Not strict UTF-8: FurMark writes its degree sign as a lone
+                // Latin-1 byte, which made a strict read drop the whole log.
                 let text = read_log(log);
                 let tail: Vec<&str> = text.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
                 self.buffer.set_text(&tail.join("\n"));
@@ -810,9 +810,18 @@ impl TestRunner {
     }
 }
 
-/// A test log as text, tolerating bytes that are not UTF-8.
+/// A test log as text. Valid UTF-8 is kept as is; any other byte is taken as
+/// Latin-1, which is what FurMark writes its degree sign in (0xB0 → °).
 fn read_log(path: &std::path::Path) -> String {
-    fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    let mut text = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(chunk.valid());
+        text.extend(chunk.invalid().iter().map(|&b| char::from(b)));
+    }
+    text
 }
 
 /// One-line read-out of a benchmark log: the torch kernel bench prints a
