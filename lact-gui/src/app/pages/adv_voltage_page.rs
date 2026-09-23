@@ -639,10 +639,11 @@ impl TestRunner {
                 "Torch bench",
                 "Throughput, not correctness: a 32B-class decoder run token by token against a KV cache \
                  (LLM decode — bandwidth-bound, the path XBAR sits on) then a batched prefill pass (compute). \
-                 10 s warm-up + 30 s timed per phase, ~1.5 min total at ~500 W; fills most of the free VRAM, so \
-                 close other GPU work first. The status line reads out tok/s, GB/s and TFLOPS; compare runs \
+                 10 s warm-up + 30 s timed per phase, ~1.5 min total at ~500 W; fixed 22 GB working set so runs compare \
+                 (needs that much free VRAM). Status line: decode tok/s + GB/s, prefill TFLOPS. Reference 2026-09-22 at \
+                 c150/m6000/x270/660 W: 61.4 tok/s, 1427 GB/s, 205 TFLOPS. Compare runs \
                  at different settings, single runs drift a few percent with temperature.",
-                format!("{v} ab_torch_kernels.py --duration 30 --warmup 10"),
+                format!("{v} ab_torch_kernels.py --duration 30 --warmup 10 --vram-gb 22"),
                 available,
             ),
             (
