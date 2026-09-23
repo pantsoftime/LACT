@@ -536,7 +536,9 @@ impl TestRunner {
                 std::env::split_paths(&path)
                     .any(|dir| dir.join("furmark").is_file())
                     .then(|| {
-                        "furmark --demo furmark-gl --p1440 --benchmark --no-score-box --print-render-speed"
+                        // --vsync 0 alone is ignored: the NVIDIA GL driver syncs to
+                        // the display (240 FPS cap on the 491CQP) unless told not to.
+                        "__GL_SYNC_TO_VBLANK=0 furmark --demo furmark-gl --p1440 --vsync 0 --benchmark --no-score-box"
                             .to_owned()
                     })
             })
@@ -648,9 +650,10 @@ impl TestRunner {
                 "Gaming-style load: FurMark 2's built-in 1440p OpenGL preset, 60 s, windowed. Raster, not \
                  compute, so it exercises the display/raster path the torch tests do not and it is the closest \
                  thing to the 3DMark and game-FPS numbers the forum results are quoted in. The status line reads \
-                 out the SCORE and min/avg/max FPS. Override the command with `furmark_cmd` in the tooling's \
-                 linuxvolt.json (e.g. a Vulkan demo, another preset, or a game launcher). Idle here on this card \
-                 is ~240 FPS at 720p — a run at low FPS with the card near idle power has not loaded the GPU.",
+                 out the SCORE and min/avg/max FPS; FurMark prints nothing until it finishes, so the output pane stays \
+                 empty for the 60 s. Vsync is off (__GL_SYNC_TO_VBLANK=0), otherwise the display's 240 Hz caps it. Override the command with `furmark_cmd` in the tooling's \
+                 linuxvolt.json (e.g. a Vulkan demo, another preset, or a game launcher). This card manages \
+                 ~910 FPS at 720p with vsync off — a run pinned at 240 FPS was vsync-capped, not GPU-bound.",
                 furmark.clone().unwrap_or_default(),
                 furmark.is_some(),
             ),
@@ -762,6 +765,12 @@ impl TestRunner {
                 gtk::glib::ControlFlow::Continue
             }
             Ok(Some(code)) => {
+                // Programs writing to a file block-buffer stdout, so their whole
+                // output can land between the read above and the exit being
+                // seen (FurMark does exactly that): read the log once more.
+                let text = fs::read_to_string(&*log).unwrap_or(text);
+                let tail: Vec<&str> = text.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
+                self.buffer.set_text(&tail.join("\n"));
                 let verdict = if text.contains("SILENT CORRUPTION") {
                     "SILENT CORRUPTION — the applied setting computes wrong results".to_owned()
                 } else if text.contains("MATCH") {
