@@ -527,7 +527,8 @@ impl TestRunner {
     }
 
     /// The gaming-style load: `furmark_cmd` from the tooling config if set,
-    /// else FurMark 2's own 1440p GL preset benchmark when the binary is
+    /// else a 60 s FurMark 2 GL benchmark in a fixed 1920x1080 window (a 1440-tall
+    /// window gets clipped by the panel on a 1440p screen) when the binary is
     /// installed. Its stdout carries the SCORE and FPS lines the status
     /// line reads out.
     fn furmark_cmd(tools_dir: &std::path::Path) -> Option<String> {
@@ -538,7 +539,7 @@ impl TestRunner {
                     .then(|| {
                         // --vsync 0 alone is ignored: the NVIDIA GL driver syncs to
                         // the display (240 FPS cap on the 491CQP) unless told not to.
-                        "__GL_SYNC_TO_VBLANK=0 furmark --demo furmark-gl --p1440 --vsync 0 --benchmark --no-score-box"
+                        "__GL_SYNC_TO_VBLANK=0 furmark --demo furmark-gl --width 1920 --height 1080 --no-resize --vsync 0 --benchmark --duration-ms 60000 --no-score-box"
                             .to_owned()
                     })
             })
@@ -648,13 +649,13 @@ impl TestRunner {
             ),
             (
                 "FurMark bench",
-                "Gaming-style load: FurMark 2's built-in 1440p OpenGL preset, 60 s, windowed. Raster, not \
+                "Gaming-style load: FurMark 2 OpenGL in a 1920x1080 window, 60 s, vsync off. Raster, not \
                  compute, so it exercises the display/raster path the torch tests do not and it is the closest \
                  thing to the 3DMark and game-FPS numbers the forum results are quoted in. The status line reads \
                  out the SCORE and min/avg/max FPS; FurMark prints nothing until it finishes, so the output pane stays \
                  empty for the 60 s. Vsync is off (__GL_SYNC_TO_VBLANK=0), otherwise the display's 240 Hz caps it. Override the command with `furmark_cmd` in the tooling's \
-                 linuxvolt.json (e.g. a Vulkan demo, another preset, or a game launcher). This card manages \
-                 ~910 FPS at 720p with vsync off — a run pinned at 240 FPS was vsync-capped, not GPU-bound.",
+                 linuxvolt.json (e.g. a Vulkan demo, another preset, or a game launcher). \
+                 Reference at daily settings, 6 s check run: ~658 FPS (the score is roughly frames rendered, so ~39k for 60 s); a run pinned at 240 FPS was vsync-capped.",
                 furmark.clone().unwrap_or_default(),
                 furmark.is_some(),
             ),

@@ -186,7 +186,7 @@ own `linuxvolt.json`. Buttons:
   status line reads the JSON result out as tok/s, GB/s and TFLOPS.
 - **FurMark bench** (2026-09-21) — the gaming-style raster load. Runs
   `furmark_cmd` from `linuxvolt.json` if set, otherwise FurMark 2's 1440p
-  OpenGL preset benchmark (60 s, windowed, vsync off via `__GL_SYNC_TO_VBLANK=0`
+  OpenGL benchmark in a fixed 1920x1080 window (60 s, vsync off via `__GL_SYNC_TO_VBLANK=0`
   — FurMark's own `--vsync 0` is ignored by the driver) when `furmark` is on `PATH`; the
   button is greyed out when neither exists. The status line reads out SCORE
   and min/avg/max FPS.
