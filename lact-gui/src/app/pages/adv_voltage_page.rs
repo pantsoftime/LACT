@@ -756,7 +756,7 @@ impl TestRunner {
         let Some((child, name, started, log)) = slot.as_mut() else {
             return gtk::glib::ControlFlow::Break;
         };
-        let text = fs::read_to_string(&*log).unwrap_or_default();
+        let text = read_log(log);
         let tail: Vec<&str> = text.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
         self.buffer.set_text(&tail.join("\n"));
         let elapsed = started.elapsed().as_secs();
@@ -769,7 +769,9 @@ impl TestRunner {
                 // Programs writing to a file block-buffer stdout, so their whole
                 // output can land between the read above and the exit being
                 // seen (FurMark does exactly that): read the log once more.
-                let text = fs::read_to_string(&*log).unwrap_or(text);
+                // Lossy: FurMark writes its degree sign as a lone Latin-1 byte,
+                // which made a strict UTF-8 read drop the whole log.
+                let text = read_log(log);
                 let tail: Vec<&str> = text.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
                 self.buffer.set_text(&tail.join("\n"));
                 let verdict = if text.contains("SILENT CORRUPTION") {
@@ -807,6 +809,11 @@ impl TestRunner {
     }
 }
 
+/// A test log as text, tolerating bytes that are not UTF-8.
+fn read_log(path: &std::path::Path) -> String {
+    fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+}
+
 /// One-line read-out of a benchmark log: the torch kernel bench prints a
 /// single JSON line; FurMark prints `- SCORE : n` and `- FPS (min/avg/max) : a / b / c`.
 fn bench_summary(text: &str) -> Option<String> {
@@ -832,7 +839,14 @@ fn bench_summary(text: &str) -> Option<String> {
             .map(|(_, v)| v.trim().to_owned())
     };
     match (field("SCORE"), field("FPS (min/avg/max)")) {
-        (Some(score), Some(fps)) => Some(format!("SCORE {score}, FPS min/avg/max {fps}")),
+        (Some(score), Some(fps)) => {
+            let fps = fps
+                .split('/')
+                .map(|v| v.trim().parse::<f64>().map_or_else(|_| v.trim().to_owned(), |n| format!("{n:.0}")))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            Some(format!("SCORE {score}, FPS min/avg/max {fps}"))
+        }
         (Some(score), None) => Some(format!("SCORE {score}")),
         _ => None,
     }
