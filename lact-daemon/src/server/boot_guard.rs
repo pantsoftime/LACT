@@ -7,7 +7,12 @@
 //!   boot id, so a marker from the same boot is recognised as a daemon
 //!   restart rather than a system crash.
 //! * `engaged.json` — the trip record, kept until the user resumes so a
-//!   daemon restart while engaged stays engaged.
+//!   daemon restart while engaged stays engaged. A clean daemon stop while
+//!   engaged stamps it with the boot id; if the next start is in a *later*
+//!   boot, that boot ended cleanly on the fallback and the trip is over
+//!   ("leave it until the next boot"). No stamp (a crash while on the
+//!   fallback, a killed daemon) or a same-boot stamp (a restart or
+//!   reinstall) stays engaged.
 //!
 //! While engaged the daemon also drops a note into `/run/motd.d/`, which
 //! `pam_motd` shows on tty / SSH logins and the shell snippets in `res/`
@@ -37,6 +42,17 @@ struct Marker {
     profile: Option<String>,
     boot_id: String,
     armed_at: u64,
+}
+
+/// `engaged.json`: the trip plus the boot in which the daemon last stopped
+/// cleanly while engaged. Records written before this field existed read as
+/// `None`, i.e. "not known to have stopped cleanly" — the safe side.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct EngagedRecord {
+    #[serde(flatten)]
+    trip: BootGuardTrip,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stopped_cleanly_in: Option<String>,
 }
 
 /// What the daemon should do at startup.
@@ -85,16 +101,36 @@ impl BootGuardStore {
     /// Decide what to do at daemon start. `force` is the one-shot flag from
     /// the config; the caller clears it after this returns.
     pub fn startup(&self, force: bool) -> anyhow::Result<Startup> {
-        if let Some(trip) = self.read_engaged()? {
-            return Ok(Startup::StillEngaged(trip));
+        self.startup_in(force, current_boot_id().as_deref())
+    }
+
+    fn startup_in(&self, force: bool, boot_id: Option<&str>) -> anyhow::Result<Startup> {
+        if let Some(record) = self.read_engaged()? {
+            match (&record.stopped_cleanly_in, boot_id) {
+                (Some(stopped), Some(now)) if stopped != now => {
+                    info!(
+                        "boot guard: the previous boot ended cleanly on the fallback; \
+                         trip for profile {:?} cleared",
+                        record.trip.profile
+                    );
+                    self.clear()?;
+                }
+                _ => {
+                    if record.stopped_cleanly_in.is_some() {
+                        // Same-boot restart: drop the stamp, so a later crash
+                        // while still engaged is not mistaken for a clean end.
+                        self.write_engaged(&record.trip, None)?;
+                    }
+                    return Ok(Startup::StillEngaged(record.trip));
+                }
+            }
         }
         let marker = self.read_armed()?;
         let now = now_secs();
-        let boot_id = current_boot_id();
         match (marker, force) {
             (Some(marker), _) => Ok(Startup::Engage(BootGuardTrip {
                 profile: marker.profile,
-                same_boot: boot_id.as_deref() == Some(marker.boot_id.as_str()),
+                same_boot: boot_id == Some(marker.boot_id.as_str()),
                 forced: false,
                 applied_fallback: None,
                 armed_at: marker.armed_at,
@@ -133,7 +169,7 @@ impl BootGuardStore {
     /// Record a trip and post the login notice.
     pub fn engage(&self, trip: &BootGuardTrip) -> anyhow::Result<()> {
         fs::create_dir_all(&self.dir)?;
-        write_durable(&self.engaged_path(), &serde_json::to_vec_pretty(trip)?)?;
+        self.write_engaged(trip, None)?;
         // The marker has done its job; a clean shutdown from here must not
         // trip again, and neither must a crash while on the fallback.
         self.disarm()?;
@@ -145,8 +181,28 @@ impl BootGuardStore {
 
     /// Keep the trip on record but drop the notice.
     pub fn acknowledge(&self, trip: &BootGuardTrip) -> anyhow::Result<()> {
-        write_durable(&self.engaged_path(), &serde_json::to_vec_pretty(trip)?)?;
+        self.write_engaged(trip, None)?;
         remove_if_present(&self.motd)
+    }
+
+    /// Clean daemon stop: if engaged, remember which boot it stopped in.
+    pub fn stopped_cleanly(&self) -> anyhow::Result<()> {
+        self.stopped_cleanly_in(current_boot_id().as_deref())
+    }
+
+    fn stopped_cleanly_in(&self, boot_id: Option<&str>) -> anyhow::Result<()> {
+        match (self.read_engaged()?, boot_id) {
+            (Some(record), Some(boot)) => self.write_engaged(&record.trip, Some(boot)),
+            _ => Ok(()),
+        }
+    }
+
+    fn write_engaged(&self, trip: &BootGuardTrip, stopped_cleanly_in: Option<&str>) -> anyhow::Result<()> {
+        let record = EngagedRecord {
+            trip: trip.clone(),
+            stopped_cleanly_in: stopped_cleanly_in.map(str::to_owned),
+        };
+        write_durable(&self.engaged_path(), &serde_json::to_vec_pretty(&record)?)
     }
 
     /// The user resumed: forget the trip.
@@ -159,7 +215,7 @@ impl BootGuardStore {
         read_json(&self.armed_path())
     }
 
-    fn read_engaged(&self) -> anyhow::Result<Option<BootGuardTrip>> {
+    fn read_engaged(&self) -> anyhow::Result<Option<EngagedRecord>> {
         read_json(&self.engaged_path())
     }
 
@@ -307,6 +363,63 @@ mod tests {
         assert_eq!(store.startup(false).unwrap(), Startup::StillEngaged(trip));
         store.clear().unwrap();
         assert_eq!(store.startup(false).unwrap(), Startup::Normal);
+    }
+
+    fn engaged(store: &BootGuardStore, boot: &str) -> BootGuardTrip {
+        store.arm(Some("daily")).unwrap();
+        let Startup::Engage(trip) = store.startup_in(false, Some(boot)).unwrap() else {
+            panic!("expected a trip");
+        };
+        store.engage(&trip).unwrap();
+        trip
+    }
+
+    #[test]
+    fn clean_stop_then_new_boot_ends_the_trip() {
+        let (_tmp, store) = store();
+        engaged(&store, "boot-a");
+        store.stopped_cleanly_in(Some("boot-a")).unwrap();
+        assert_eq!(store.startup_in(false, Some("boot-b")).unwrap(), Startup::Normal);
+        assert!(!store.engaged_path().exists());
+        assert!(!store.motd.exists());
+    }
+
+    #[test]
+    fn clean_stop_then_same_boot_restart_stays_engaged_and_unstamps() {
+        let (_tmp, store) = store();
+        let trip = engaged(&store, "boot-a");
+        store.stopped_cleanly_in(Some("boot-a")).unwrap();
+        // daemon restart / reinstall in the same boot
+        assert_eq!(store.startup_in(false, Some("boot-a")).unwrap(), Startup::StillEngaged(trip.clone()));
+        // ...then the machine crashes while still on the fallback: no stamp
+        // any more, so the next boot must still be engaged.
+        assert_eq!(store.startup_in(false, Some("boot-b")).unwrap(), Startup::StillEngaged(trip));
+    }
+
+    #[test]
+    fn crash_while_engaged_stays_engaged_across_boots() {
+        let (_tmp, store) = store();
+        let trip = engaged(&store, "boot-a");
+        assert_eq!(store.startup_in(false, Some("boot-b")).unwrap(), Startup::StillEngaged(trip));
+    }
+
+    #[test]
+    fn clean_stop_after_a_new_boot_can_still_trip_on_a_fresh_marker() {
+        let (_tmp, store) = store();
+        engaged(&store, "boot-a");
+        store.stopped_cleanly_in(Some("boot-a")).unwrap();
+        // Something re-armed (e.g. the profile applied) before the check:
+        store.arm(Some("daily")).unwrap();
+        assert!(matches!(store.startup_in(false, Some("boot-b")).unwrap(), Startup::Engage(_)));
+    }
+
+    #[test]
+    fn record_without_stamp_field_reads_as_not_stopped_cleanly() {
+        let (_tmp, store) = store();
+        let trip = engaged(&store, "boot-a");
+        // the format written before this change: the bare trip
+        fs::write(store.engaged_path(), serde_json::to_vec(&trip).unwrap()).unwrap();
+        assert_eq!(store.startup_in(false, Some("boot-b")).unwrap(), Startup::StillEngaged(trip));
     }
 
     #[test]

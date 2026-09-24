@@ -352,10 +352,15 @@ impl<'a> Handler {
         }
     }
 
-    /// Clean shutdown: nothing will be applied until the next start.
+    /// Clean shutdown: nothing will be applied until the next start. If the
+    /// guard is engaged, record that this boot's daemon stopped cleanly, so
+    /// the next boot (not a restart in this one) ends the trip.
     pub fn boot_guard_shutdown(&self) {
         if let Err(err) = self.boot_guard_store.disarm() {
             error!("could not clear the boot guard marker: {err:#}");
+        }
+        if let Err(err) = self.boot_guard_store.stopped_cleanly() {
+            error!("could not record the clean stop on the boot guard trip: {err:#}");
         }
     }
 

@@ -333,7 +333,13 @@ applies the **fallback** instead of the saved profile. The fallback is
 kernel boot means only the daemon died, the controllers are reset first so
 nothing survives from before — or a named profile. Automatic profile
 switching is not started while engaged, so a process rule cannot re-apply
-the suspect profile. The trip survives daemon restarts until it is resolved.
+the suspect profile. The trip survives daemon restarts within the boot, and
+an unclean stop while on the fallback, until it is resolved. A *clean*
+shutdown while engaged ends it: the daemon stamps the trip record with the
+boot id as it stops, and a start in a later boot finds the stamp and clears
+the trip (fixed 2026-09-23 — before that, an unresolved trip stayed engaged
+across every clean reboot). Resuming from the GUI now also reloads the pages,
+so the re-applied profile shows instead of the stock values loaded at start.
 
 **Resolving it.** The GUI shows a banner ("Boot guard engaged: the system
 stopped uncleanly while profile 'bench' was active. The GPU is running stock
