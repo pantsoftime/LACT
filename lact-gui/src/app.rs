@@ -681,8 +681,12 @@ impl AppModel {
             AppMsg::BootGuardResume => {
                 let client = self.daemon_client.clone();
                 relm4::spawn_local(async move {
-                    if let Err(err) = client.boot_guard_resume().await {
-                        APP_BROKER.send(AppMsg::Error(Arc::new(err)));
+                    match client.boot_guard_resume().await {
+                        // The profile was just re-applied by the daemon: reload so
+                        // the OC and Advanced pages show it, not the fallback they
+                        // loaded at startup (only the live power stats refreshed).
+                        Ok(_) => APP_BROKER.send(AppMsg::ReloadData { full: false }),
+                        Err(err) => APP_BROKER.send(AppMsg::Error(Arc::new(err))),
                     }
                 });
             }

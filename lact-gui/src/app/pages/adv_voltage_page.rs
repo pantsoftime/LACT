@@ -18,6 +18,7 @@
 
 use crate::app::graphs_window::stat::StatType;
 use crate::app::msg::AppMsg;
+use crate::APP_BROKER;
 use crate::app::pages::PageUpdate;
 use gtk::prelude::*;
 use lact_client::DaemonClient;
@@ -976,7 +977,12 @@ impl BootGuardPanel {
                 let s = s.clone();
                 relm4::spawn_local(async move {
                     let result = s.client.boot_guard_resume().await;
+                    let resumed = result.is_ok();
                     s.answer(result);
+                    if resumed {
+                        // Same as the banner's Resume: show the re-applied profile.
+                        APP_BROKER.send(AppMsg::ReloadData { full: false });
+                    }
                 });
             });
         }
