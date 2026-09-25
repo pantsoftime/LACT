@@ -66,9 +66,9 @@ Blackwell card: the NVML-backed controls the Overclocking page also has
 (core and memory offset, power limit, voltage boost, locked core clock) plus
 the ones only this page reaches.
 
-| Telemetry, clock and voltage cards, rail limits | Memory, power and current limits, boost limits, V/F curves, tests |
+| Telemetry, clock and voltage cards, rail limits | Memory and power, thermal inputs, memory timings, boost limits, V/F curves, boot guard, tests |
 | --- | --- |
-| ![Advanced page: telemetry tiles including the rail currents, the core and fabric cards and the two rail-limit cards](./res/screenshots/advanced-1.png) | ![Advanced page: memory, power-limit and OCP cards, the boost-limit panel, the clock domain V/F curves and the test runner](./res/screenshots/advanced-2.png) |
+| ![Advanced page: telemetry tiles including the rail currents and the PWRCLK and HUB clocks, the core and fabric cards and the two rail-limit cards](./res/screenshots/advanced-1.png) | ![Advanced page: memory, power-limit and OCP cards, the thermal inputs, the memory timings table, the boost-limit panel, the clock domain V/F curves with the curve editor, the boot guard row and the test runner with the torch and FurMark benches](./res/screenshots/advanced-2.png) |
 
 The **Boot guard** row, between the V/F curves and the tests, is the safety net for the rest
 of it: with it on, the daemon writes a marker before applying settings and
