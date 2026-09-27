@@ -220,10 +220,25 @@ impl BootGuardStore {
     }
 
     fn write_motd(&self, trip: &BootGuardTrip) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         let dir = self.motd.parent().unwrap();
         fs::create_dir_all(dir)?;
         fs::write(&self.motd, motd_text(trip))?;
+        // The daemon runs with a restrictive umask (set for the socket), so
+        // without this the directory came out 0700 and pam_motd / the shell
+        // snippets could not read the notice ("Permission denied" at login).
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&self.motd, fs::Permissions::from_mode(0o644))?;
         Ok(())
+    }
+
+    /// A trip carried over from an earlier boot: /run is fresh, so put the
+    /// notice back unless the user had already acknowledged it.
+    pub fn refresh_motd(&self, trip: &BootGuardTrip) -> anyhow::Result<()> {
+        if trip.acknowledged {
+            return Ok(());
+        }
+        self.write_motd(trip)
     }
 }
 
@@ -420,6 +435,33 @@ mod tests {
         // the format written before this change: the bare trip
         fs::write(store.engaged_path(), serde_json::to_vec(&trip).unwrap()).unwrap();
         assert_eq!(store.startup_in(false, Some("boot-b")).unwrap(), Startup::StillEngaged(trip));
+    }
+
+    #[test]
+    fn motd_is_world_readable_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, store) = store();
+        // Simulate what the daemon's 0177 umask produced (the umask itself is
+        // process-wide, so it is not changed here): a 0700 dir and a 0600 file.
+        let dir = store.motd.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&store.motd, b"stale").unwrap();
+        fs::set_permissions(&store.motd, fs::Permissions::from_mode(0o600)).unwrap();
+        let trip = engaged(&store, "boot-a");
+        let dir_mode = fs::metadata(store.motd.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&store.motd).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o755);
+        assert_eq!(file_mode, 0o644);
+        // still-engaged in a later boot: the notice comes back unless acknowledged
+        fs::remove_file(&store.motd).unwrap();
+        store.refresh_motd(&trip).unwrap();
+        assert!(store.motd.exists());
+        let mut acked = trip.clone();
+        acked.acknowledged = true;
+        fs::remove_file(&store.motd).unwrap();
+        store.refresh_motd(&acked).unwrap();
+        assert!(!store.motd.exists());
     }
 
     #[test]

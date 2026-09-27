@@ -303,7 +303,12 @@ impl<'a> Handler {
         }
         let trip = match startup {
             Startup::Normal => return false,
-            Startup::StillEngaged(trip) => trip,
+            Startup::StillEngaged(trip) => {
+                if let Err(err) = self.boot_guard_store.refresh_motd(&trip) {
+                    warn!("could not restore the boot-guard login notice: {err:#}");
+                }
+                trip
+            }
             Startup::Engage(mut trip) => {
                 let (_, selected) = self.config.read().await.with_fallback(fallback.as_deref());
                 if fallback.is_some() && selected.is_none() {
