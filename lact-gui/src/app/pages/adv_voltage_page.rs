@@ -2659,7 +2659,11 @@ Observed on this card: rated 180 A; ~72 A drawn at the 620 W limit. 50 A throttl
              CONFIG1, decoded with NVIDIA's public Memory Tweak Table layout) and the broadcast window, \
              in memory-controller clocks. Read-only: they change with the memory P-state, so the idle \
              table differs from the loaded one. The decode checks itself: tRC = tRAS + tRP holds on every \
-             row or the daemon shows nothing.",
+             row or the daemon shows nothing.\n\nObserved on this card (2026-09-27): these registers cannot be \
+             changed at runtime. A register write through the driver returns success but is silently dropped by \
+             the hardware's privilege mask (the same write to an unprotected scratch register lands), so no \
+             host-side tool can tune GDDR7 timings on Blackwell. The Matrix, Astral XOC and Lightning vBIOSes \
+             carry byte-identical timing tables; a different table would need a different signed vBIOS.",
             false,
         ));
         content.append(&timings_header);
