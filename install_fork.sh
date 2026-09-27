@@ -39,6 +39,8 @@ fi
 
 echo "== enabling service =="
 systemctl daemon-reload
+# A daemon that crashed repeatedly leaves the unit in 'failed' / start-limit-hit.
+systemctl reset-failed lactd 2>/dev/null || true
 systemctl enable --now lactd
 sleep 3
 systemctl --no-pager --lines=0 status lactd | head -3

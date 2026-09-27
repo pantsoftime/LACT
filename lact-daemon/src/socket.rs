@@ -9,7 +9,7 @@ use std::{
     str::FromStr,
 };
 use tokio::net::UnixListener;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     config,
@@ -40,14 +40,7 @@ pub fn cleanup() {
 pub fn listen() -> anyhow::Result<(UnixListener, PathBuf)> {
     let socket_path = get_socket_path();
 
-    if socket_path.exists() {
-        return Err(anyhow!(
-            "Socket {} already exists. \
-            This probably means that another instance of lact-daemon is currently running. \
-            If you are sure that this is not the case, please remove the file",
-            socket_path.display()
-        ));
-    }
+    claim_socket_path(&socket_path)?;
 
     let socket_mask = Mode::S_IXUSR | Mode::S_IXGRP | Mode::S_IRWXO;
     umask(socket_mask);
@@ -56,6 +49,36 @@ pub fn listen() -> anyhow::Result<(UnixListener, PathBuf)> {
 
     info!("listening on {socket_path:?}");
     Ok((listener, socket_path))
+}
+
+/// Make `path` free for a new listener. A socket left behind by a daemon
+/// that was killed or crashed (SIGKILL, OOM, a panic that skipped cleanup)
+/// used to block every restart, so systemd's `Restart=on-failure` hit the
+/// start limit and the daemon stayed down. A live daemon accepts a
+/// connection; a stale socket refuses it, and only then is it removed.
+fn claim_socket_path(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(anyhow!(
+            "Socket {} already exists and another instance of lact-daemon is answering on it",
+            path.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+            warn!(
+                "removing stale socket {} (nothing is listening; the previous daemon did not shut down cleanly)",
+                path.display()
+            );
+            fs::remove_file(path)
+                .with_context(|| format!("Could not remove stale socket {}", path.display()))
+        }
+        Err(err) => Err(anyhow!(
+            "Socket {} already exists and could not be probed ({err}). \
+            If no other instance of lact-daemon is running, please remove the file",
+            path.display()
+        )),
+    }
 }
 
 pub async fn set_permissions(
@@ -105,4 +128,35 @@ pub async fn set_permissions(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claim_socket_path;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn missing_path_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        claim_socket_path(&dir.path().join("lactd.sock")).unwrap();
+    }
+
+    #[test]
+    fn stale_socket_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lactd.sock");
+        drop(UnixListener::bind(&path).unwrap()); // file stays, nobody listens
+        assert!(path.exists());
+        claim_socket_path(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn live_socket_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lactd.sock");
+        let _live = UnixListener::bind(&path).unwrap();
+        assert!(claim_socket_path(&path).is_err());
+        assert!(path.exists());
+    }
 }
