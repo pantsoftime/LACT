@@ -156,6 +156,10 @@ missing-stat = N/A
 vram-usage = VRAM Usage:
 gtt-usage = GTT Usage:
 
+igpu-section = Integrated Graphics
+uma-carveout = UMA Carveout Size
+uma-carveout-caption = Amount of memory reserved as dedicated VRAM. Requires a reboot to take effect.
+
 performance-level-auto = Automatic
 performance-level-high = Highest Clocks
 performance-level-low = Lowest Clocks
@@ -219,6 +223,7 @@ pstate-clock-offset = P-State {$pstate} Clock Offset
 pstate-clock = P-State {$pstate} Clock
 pstate-clock-voltage = P-State {$pstate} Voltage
 
+pstate = Power State
 pstates = Power States
 gpu-pstates = GPU Power States
 vram-pstates = VRAM Power States
