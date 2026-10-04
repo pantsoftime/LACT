@@ -143,7 +143,9 @@ covered by the confirm-or-revert timer like any other setting.
   what bounds the core.
 
 Details, layouts and the full record are in
-[docs/ADVANCED_PAGE.md](docs/ADVANCED_PAGE.md).
+[docs/ADVANCED_PAGE.md](docs/ADVANCED_PAGE.md). What each control is measurably
+worth, how it fails, and how to tell a good setting from one that only looks
+good is in [docs/TUNING_GUIDE.md](docs/TUNING_GUIDE.md).
 
 # The WireView II page (this fork)
 
@@ -211,6 +213,7 @@ not a benchmark.
 - [Hardware support](https://github.com/ilya-zlobintsev/LACT/wiki/Hardware-Support)
 - [Frequently asked questions](https://github.com/ilya-zlobintsev/LACT/wiki/Frequently-asked-questions)
 - [Enable overclocking on AMD](https://github.com/ilya-zlobintsev/LACT/wiki/Overclocking-(AMD))
+- [Tuning guide (Advanced page)](./docs/TUNING_GUIDE.md)
 - [Config file reference](./docs/CONFIG.md)
 - [API](./docs/API.md)
 - [Power profiles daemon note](#power-profiles-daemon-note)
