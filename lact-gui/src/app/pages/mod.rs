@@ -5,6 +5,8 @@ pub mod info_page;
 pub mod oc_page;
 pub mod software_page;
 pub mod thermals_page;
+/// This fork: the tuning guide window opened from the Advanced page
+pub mod tuning_guide;
 pub mod wireview_page;
 
 use lact_schema::{DeviceInfo, DeviceStats};

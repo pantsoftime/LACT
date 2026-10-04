@@ -20,6 +20,7 @@ use crate::app::graphs_window::stat::StatType;
 use crate::app::msg::AppMsg;
 use crate::APP_BROKER;
 use crate::app::pages::PageUpdate;
+use crate::app::pages::tuning_guide;
 use gtk::prelude::*;
 use lact_client::DaemonClient;
 use lact_schema::boot_guard::{BootGuardConfig, BootGuardStatus};
@@ -2267,6 +2268,31 @@ impl relm4::Component for AdvVoltagePage {
             .build();
         content.append(&status_label);
 
+        // ---- the tuning guide, at the top so it is found before anything is
+        // changed. Each card's tooltip covers its own control; the guide is
+        // what spans them: which knob is worth turning, what a safe starting
+        // point looks like, and how to tell a good setting from one that only
+        // looks good.
+        {
+            let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            bar.set_halign(gtk::Align::End);
+            let button_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            button_content.append(&gtk::Image::from_icon_name("help-about-symbolic"));
+            button_content.append(&gtk::Label::new(Some("Tuning guide")));
+            let guide_button = gtk::Button::builder()
+                .child(&button_content)
+                .css_classes(["flat"])
+                .tooltip_text(
+                    "What each control is measurably worth, safe starting configs, how to validate a setting by correctness rather than by the absence of crashes, and the measurement traps.",
+                )
+                .build();
+            guide_button.connect_clicked(|button| {
+                tuning_guide::present(button.root().and_downcast::<gtk::Window>().as_ref());
+            });
+            bar.append(&guide_button);
+            content.append(&bar);
+        }
+
         // ---- live telemetry row: a flow box, so extra tiles wrap on a
         // narrow window instead of squeezing the row; homogeneous keeps the
         // tiles the same width.
@@ -2456,7 +2482,7 @@ Observed on this card: +20 mV lowered XBAR by ~31 MHz on its own and did not ext
             "What it is: an offset, MHz, on the SYS clock domain (the system / host-interface clock) through the RM interface.\n\
 Effect: + raises the SYS clock. It normally follows XBAR through the ratio; this moves it independently.\n\
 Use: rarely useful on its own; leave at 0 unless a workload is known to be SYS-bound.\n\
-Observed: domain verified; never harness-validated at a positive value on this card.",
+Observed on this card: 0, +200 and +400 all passed; no ceiling was found because none was looked for. Worth +0.02 % on decode — nothing — in two separate sessions; the 1 % loss an early pass seemed to show was thermal drift, caught by re-running the reference last.",
             false,
             &sender,
         );
@@ -2507,7 +2533,7 @@ Use: only with a video clock offset that needs it. Untested here.",
             "What it is: the clock arbiter's GPC→XBAR propagation ratio (factory 0.900 on GB202), the constraint that keeps the fabric clock at least this fraction of the core clock.\n\
 Effect: it is a floor, not XBAR = GPC × ratio: XBAR and SYS follow the core upward when the constraint binds. Raising it pulls the fabric up with the core; lowering it lets the fabric lag.\n\
 Use: an alternative to a fixed XBAR offset that scales with the core clock. Both together compound.\n\
-Observed on this card: the same silent-corruption ceiling applies to the resulting XBAR clock, whichever control gets there.",
+Observed on this card: the same silent-corruption ceiling applies to the resulting XBAR clock, whichever control gets there. At the offsets tested here the constraint did not bind, so moving it changed nothing.",
             true,
             &sender,
         );
