@@ -1042,7 +1042,10 @@ impl BootGuardState {
         self.fallback.set_model(Some(&gtk::StringList::new(&items)));
         self.loading.set(false);
         *self.profiles.borrow_mut() = names;
-        if let Some(last) = self.last.borrow().clone() {
+        // Take the status out first: a borrow in an `if let` scrutinee lives
+        // through the body, and `show` writes `last`.
+        let last = self.last.borrow().clone();
+        if let Some(last) = last {
             self.show(&last);
         }
     }
