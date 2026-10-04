@@ -38,6 +38,7 @@ pub enum AppMsg {
     DumpVBios,
     DebugSnapshot,
     ShowPreferencesDialog,
+    ExperimentalFeaturesChanged,
     ShowAboutDialog,
     ShowOverdriveDialog,
     ShowServiceSetupDialog,
