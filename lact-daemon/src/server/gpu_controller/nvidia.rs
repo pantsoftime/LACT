@@ -2386,6 +2386,31 @@ impl GpuController for NvidiaGpuController {
 
             let clocks = &config.clocks_configuration;
 
+            // Voltage boost and the rail voltage and current limits go first,
+            // while every offset is still at the zero reset_clocks() left it
+            // at. A clock offset that needs a raised limit must not be applied
+            // before the limit (with the limits last, an offset that only runs
+            // at the higher voltage can crash the driver before the limit
+            // arrives - mVolt issue #65); and lowering a limit after
+            // reset_clocks() never meets an offset still sized for the old
+            // limit. Boost precedes the deltas because it moves the same
+            // ceilings, and the deltas' device-maximum check reads the
+            // evaluated limits.
+            if let Some(percent) = clocks.voltage_boost
+                && let Err(err) = self.apply_voltage_boost(percent)
+            {
+                warn!("could not apply voltage boost: {err:#}");
+
+                if self.voltage_boost_written.get()
+                    && let Err(err) = self.reset_voltage_boost()
+                {
+                    warn!("could not reset voltage boost: {err:#}");
+                }
+            }
+
+            self.apply_rm_rail_limits(clocks)?;
+            self.apply_rm_rail_current_limits(clocks)?;
+
             match (clocks.min_core_clock, clocks.max_core_clock) {
                 (Some(min), Some(max)) => {
                     debug!("applying GPU locked clocks: {min}..{max}");
@@ -2454,23 +2479,9 @@ impl GpuController for NvidiaGpuController {
                     .context("Could not apply VF curve")?;
             }
 
-            if let Some(percent) = clocks.voltage_boost
-                && let Err(err) = self.apply_voltage_boost(percent)
-            {
-                warn!("could not apply voltage boost: {err:#}");
-
-                if self.voltage_boost_written.get()
-                    && let Err(err) = self.reset_voltage_boost()
-                {
-                    warn!("could not reset voltage boost: {err:#}");
-                }
-            }
-
             self.apply_rm_offsets(clocks)?;
             self.apply_rm_domain_vf_offsets(clocks)?;
             self.apply_rm_propagation(clocks)?;
-            self.apply_rm_rail_limits(clocks)?;
-            self.apply_rm_rail_current_limits(clocks)?;
             self.apply_rm_thermal_inputs(clocks, config.fan_control_enabled)?;
 
             if config.fan_control_enabled {
