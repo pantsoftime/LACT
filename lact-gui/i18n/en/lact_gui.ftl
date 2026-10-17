@@ -12,6 +12,7 @@ thermals-page = Thermals
 software-page = Software Info
 displays-page = Display Info
 adv-voltage-page = Advanced
+vbios-page = VBIOS
 wireview-page = WireView II
 detach-page = Detach {$page}
 page-detached = This page is open in another window.

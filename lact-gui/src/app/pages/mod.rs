@@ -7,6 +7,8 @@ pub mod software_page;
 pub mod thermals_page;
 /// This fork: the tuning guide window opened from the Advanced page
 pub mod tuning_guide;
+/// This fork: the VBIOS page (NVIDIA)
+pub mod vbios_page;
 pub mod wireview_page;
 
 use lact_schema::{DeviceInfo, DeviceStats};
@@ -23,6 +25,8 @@ pub enum PageId {
     AdvVoltage,
     /// This fork: the WireView Pro II page
     WireView,
+    /// This fork: the VBIOS page
+    Vbios,
     Crash,
 }
 
@@ -36,6 +40,7 @@ impl PageId {
             Self::Displays => "displays_page",
             Self::AdvVoltage => "adv_voltage_page",
             Self::WireView => "wireview_page",
+            Self::Vbios => "vbios_page",
             Self::Crash => "crash_page",
         }
     }

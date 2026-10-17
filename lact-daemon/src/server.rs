@@ -229,6 +229,7 @@ async fn handle_request<'a>(
             ok_response(handler.set_enabled_power_states(id, kind, states).await?)
         }
         Request::VbiosDump { id } => ok_response(handler.vbios_dump(id).await?),
+        Request::VbiosInfo { id } => ok_response(handler.vbios_info(id).await?),
         Request::ListProfiles { include_state } => {
             ok_response(handler.list_profiles(include_state).await)
         }

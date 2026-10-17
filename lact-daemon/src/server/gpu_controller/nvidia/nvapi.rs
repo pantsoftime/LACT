@@ -38,6 +38,12 @@ const QUERY_NVAPI_GPU_CLOCK_CLIENT_CLK_VF_POINTS_SET_CONTROL: u32 = 0x733e009;
 const QUERY_NVAPI_GPU_CLOCK_CLIENT_CLK_VF_POINTS_GET_CONTROL: u32 = 0x23f1b133;
 const QUERY_NVAPI_GPU_REGISTER_OP: u32 = 0x2eb3c140;
 const QUERY_NVAPI_GPU_GET_ALL_CLOCKS: u32 = 0x1bd69f49;
+const QUERY_NVAPI_GPU_PERF_VFE_VAR_GET_INFO: u32 = 0xb9da41d6;
+const QUERY_NVAPI_GPU_PERF_VFE_VAR_GET_CONTROL: u32 = 0x5d387298;
+
+/// Guard bytes after variable-size query buffers, checked after every call.
+const QUERY_BUFFER_GUARD: usize = 4096;
+const QUERY_BUFFER_GUARD_BYTE: u8 = 0xcd;
 
 const REG_OFFSET_BLACKWELL_HOTSPOT_AGGREGATED: u32 = 0xad0aa0;
 
@@ -452,6 +458,68 @@ impl NvApi {
         self.handle_status(status)?;
 
         Ok(())
+    }
+
+    /// Calls a physical-GPU query on a zeroed byte buffer of `size` bytes whose first word is
+    /// the struct version, for structures too large to keep on the stack. Guard bytes after
+    /// the buffer catch a driver whose ABI writes past the size this side expects.
+    unsafe fn physical_gpu_query_bytes(
+        &self,
+        handle: NvPhysicalGpuHandle,
+        query_id: u32,
+        version: u32,
+        size: usize,
+        seed: &[(usize, &[u8])],
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut buf = vec![0u8; size + QUERY_BUFFER_GUARD];
+        buf[size..].fill(QUERY_BUFFER_GUARD_BYTE);
+        buf[..4].copy_from_slice(&version.to_le_bytes());
+        for (offset, bytes) in seed {
+            buf[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+        }
+
+        let f = self.query_interface(query_id)?;
+        let f: unsafe extern "C" fn(NvPhysicalGpuHandle, *mut u8) -> NvAPI_Status = transmute(f);
+        let status = f(handle, buf.as_mut_ptr());
+
+        if buf[size..].iter().any(|b| *b != QUERY_BUFFER_GUARD_BYTE) {
+            bail!("NvAPI query {query_id:x} wrote past its buffer (unexpected driver ABI)");
+        }
+        self.handle_status(status)?;
+        buf.truncate(size);
+        Ok(buf)
+    }
+
+    /// Reads the VFE fuse variables and decodes Speedo / ASIC quality / IDDQ.
+    pub fn asic_quality(
+        &self,
+        handle: NvPhysicalGpuHandle,
+    ) -> anyhow::Result<Option<lact_schema::NvidiaAsicQuality>> {
+        use super::asic_quality::{
+            CONTROL_SIZE, CONTROL_VERSION, INFO_SIZE, INFO_VERSION, MASK_RANGE, parse,
+        };
+
+        unsafe {
+            let info = self.physical_gpu_query_bytes(
+                handle,
+                QUERY_NVAPI_GPU_PERF_VFE_VAR_GET_INFO,
+                INFO_VERSION,
+                INFO_SIZE,
+                &[],
+            )?;
+            // The control query takes the variable mask reported by the info query.
+            let control = self
+                .physical_gpu_query_bytes(
+                    handle,
+                    QUERY_NVAPI_GPU_PERF_VFE_VAR_GET_CONTROL,
+                    CONTROL_VERSION,
+                    CONTROL_SIZE,
+                    &[(MASK_RANGE.start, &info[MASK_RANGE])],
+                )
+                .inspect_err(|err| error!("could not read VFE variable control: {err:#}"))
+                .ok();
+            Ok(parse(&info, control.as_deref()))
+        }
     }
 
     /// Gets the value from `NvApiThermals` if possible, otherwise reads from register
