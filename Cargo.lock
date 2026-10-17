@@ -1799,6 +1799,7 @@ dependencies = [
  "jiff",
  "lact-daemon",
  "lact-schema",
+ "lact-vbios",
  "libcopes",
  "libdisplay-info",
  "libdrm_amdgpu_sys",
@@ -1869,6 +1870,7 @@ dependencies = [
  "i18n-embed",
  "i18n-embed-fl",
  "indexmap",
+ "lact-vbios",
  "nvml-wrapper",
  "rust-embed",
  "serde",
@@ -1876,6 +1878,15 @@ dependencies = [
  "serde_json",
  "serde_with",
  "vergen-gitcl",
+]
+
+[[package]]
+name = "lact-vbios"
+version = "0.10.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ mock = []
 
 [dependencies]
 lact-schema = { path = "../lact-schema" }
+lact-vbios = { path = "../lact-vbios" }
 
 amdgpu-sysfs = { workspace = true }
 anyhow = { workspace = true }

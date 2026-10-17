@@ -70,6 +70,9 @@ pub enum Request<'a> {
     VbiosDump {
         id: &'a str,
     },
+    VbiosInfo {
+        id: &'a str,
+    },
     ListProfiles {
         #[serde(default)]
         include_state: bool,

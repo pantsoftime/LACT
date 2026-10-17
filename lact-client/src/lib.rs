@@ -233,6 +233,7 @@ impl DaemonClient {
     request_with_id!(get_power_states, GetPowerStates, PowerStates);
     request_with_id!(reset_pmfw, ResetPmfw, u64);
     request_with_id!(dump_vbios, VbiosDump, Vec<u8>);
+    request_with_id!(get_vbios_info, VbiosInfo, lact_schema::vbios::VbiosInfo);
     request_with_id!(get_process_list, ProcessList, ProcessList);
     request_with_id!(get_displays_info, DisplaysInfo, DisplaysInfo);
     request_with_id!(detach, DetachGpu, ());

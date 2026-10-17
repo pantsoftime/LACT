@@ -56,6 +56,7 @@ use page_navigation::{PageNavigation, PageNavigationInit, PageNavigationMsg};
 use pages::{
     PageId, PageUpdate,
     adv_voltage_page::{AdvVoltagePage, AdvVoltagePageMsg},
+    vbios_page::{VbiosPage, VbiosPageMsg},
     wireview_page::WireViewPage,
     crash_page::CrashPage,
     info_page::InformationPage,
@@ -121,6 +122,7 @@ pub struct AppModel {
     info_page: relm4::Controller<InformationPage>,
     oc_page: relm4::Controller<OcPage>,
     adv_voltage_page: relm4::Controller<AdvVoltagePage>,
+    vbios_page: relm4::Controller<VbiosPage>,
     // Held so the page component stays alive; its widget lives in the navigation list.
     #[allow(dead_code)]
     wireview_page: relm4::Controller<WireViewPage>,
@@ -435,6 +437,9 @@ impl AsyncComponent for AppModel {
             .launch(daemon_client.clone())
             .forward(sender.input_sender(), |msg| msg);
         let wireview_page = WireViewPage::builder().launch(daemon_client.clone()).detach();
+        let vbios_page = VbiosPage::builder()
+            .launch(daemon_client.clone())
+            .forward(sender.input_sender(), |msg| msg);
 
         let ui_sensitive = BoolBinding::new(false);
         let page_navigation = PageNavigation::detach(PageNavigationInit {
@@ -473,6 +478,11 @@ impl AsyncComponent for AppModel {
                     PageId::WireView,
                     fl!(I18N, "wireview-page"),
                     wireview_page.widget().clone().upcast(),
+                ),
+                (
+                    PageId::Vbios,
+                    fl!(I18N, "vbios-page"),
+                    vbios_page.widget().clone().upcast(),
                 ),
             ],
             parent: root.clone(),
@@ -541,6 +551,7 @@ impl AsyncComponent for AppModel {
             info_page,
             oc_page,
             adv_voltage_page,
+            vbios_page,
             wireview_page,
             thermals_page,
             software_page,
@@ -863,6 +874,7 @@ impl AppModel {
                 }
             }
             AppMsg::Stats(stats) => {
+                self.vbios_page.emit(VbiosPageMsg::Stats(stats.clone()));
                 let update = PageUpdate::Stats(stats.clone());
                 self.adv_voltage_page.emit(AdvVoltagePageMsg::Update {
                     update: update.clone(),
@@ -1171,6 +1183,10 @@ impl AppModel {
 
         let update = PageUpdate::Info(info.clone());
         self.info_page.emit(update.clone());
+        self.vbios_page.emit(VbiosPageMsg::Gpu {
+            id: gpu_id.clone(),
+            info: info.clone(),
+        });
         self.oc_page.emit(OcPageMsg::Update {
             update: update.clone(),
             initial: true,
@@ -1254,6 +1270,7 @@ impl AppModel {
             .context("Could not fetch stats")?;
         let stats = Arc::new(stats);
 
+        self.vbios_page.emit(VbiosPageMsg::Stats(stats.clone()));
         let update = PageUpdate::Stats(stats.clone());
         self.info_page.emit(update.clone());
         self.thermals_page.emit(ThermalsPageMsg::Update {

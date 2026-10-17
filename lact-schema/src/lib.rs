@@ -5,6 +5,7 @@ pub mod config;
 pub mod i18n;
 mod profiles;
 pub mod request;
+pub mod vbios;
 pub mod wireview;
 mod response;
 
@@ -354,6 +355,25 @@ impl DeviceInfo {
                 (fl!(LANGUAGE_LOADER, "vram-type"), vram_type),
             ]);
 
+            if let Some(asic) = &drm_info.nvidia_asic_quality {
+                let mut speedo = asic.speedo.to_string();
+                if let Some(quality) = asic.quality_percent {
+                    write!(speedo, " ({})", fl!(LANGUAGE_LOADER, "asic-quality-percent", percent = format!("{quality:.1}"))).unwrap();
+                }
+                if asic.fuse_override {
+                    speedo.push_str(" *");
+                }
+                elements.push((fl!(LANGUAGE_LOADER, "asic-speedo"), Some(speedo)));
+
+                let iddq = [("NVVDD", asic.nvvdd_iddq), ("MSVDD", asic.msvdd_iddq)]
+                    .into_iter()
+                    .filter_map(|(rail, value)| value.map(|value| format!("{rail} {value}")))
+                    .collect::<Vec<_>>();
+                if !iddq.is_empty() {
+                    elements.push((fl!(LANGUAGE_LOADER, "asic-iddq"), Some(iddq.join(", "))));
+                }
+            }
+
             if let Some(memory_info) = &drm_info.memory_info {
                 if let Some(rebar) = memory_info.resizeable_bar {
                     let rebar = if rebar {
@@ -420,6 +440,21 @@ pub struct DrmInfo {
     pub amd_uma_carveout: Option<AmdUmaCarveout>,
     #[serde(flatten)]
     pub intel: IntelDrmInfo,
+    pub nvidia_asic_quality: Option<NvidiaAsicQuality>,
+}
+
+/// Silicon fuse readings of an NVIDIA GPU, from the driver's VFE variables.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NvidiaAsicQuality {
+    pub speedo: i64,
+    /// Driver-reported Speedo bounds the quality percentage is normalised to.
+    pub speedo_range: Option<(f32, f32)>,
+    /// `100 * (speedo - low) / (high - low)`; not a percentile or a performance score.
+    pub quality_percent: Option<f32>,
+    pub nvvdd_iddq: Option<i64>,
+    pub msvdd_iddq: Option<i64>,
+    /// A fuse override is active, so a value may differ from the chip's fuses.
+    pub fuse_override: bool,
 }
 
 /// Options for iGPU UMA allocation
