@@ -902,6 +902,10 @@ impl<'a> Handler {
         self.controller_by_id(id).await?.vbios_dump()
     }
 
+    pub async fn vbios_info(&self, id: &str) -> anyhow::Result<lact_schema::vbios::VbiosInfo> {
+        self.controller_by_id(id).await?.vbios_info()
+    }
+
     pub async fn generate_snapshot(&self) -> anyhow::Result<String> {
         let datetime = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S");
         let out_path = format!("/tmp/LACT-v{DAEMON_VERSION}-snapshot-{datetime}.tar.gz");

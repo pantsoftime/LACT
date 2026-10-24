@@ -1,3 +1,4 @@
+mod asic_quality;
 pub mod clock_client;
 mod driver;
 pub mod nvapi;
@@ -9,6 +10,7 @@ mod rm_pwr;
 mod rm_therm;
 mod rm_vf;
 mod rm_volt;
+mod vbios;
 
 use super::{CommonControllerInfo, FanControlHandle, GpuController};
 use crate::{
@@ -125,6 +127,8 @@ pub struct NvidiaGpuController {
     rm_fb: Option<MemoryTimings>,
     timings_cache: RefCell<Option<Cached<Vec<NvidiaMemoryTimingRow>>>>,
     nvapi_thermals_info: Option<NvApiThermChannelInfo>,
+    /// Speedo / IDDQ fuse readings; constant, so read once
+    asic_quality: Option<lact_schema::NvidiaAsicQuality>,
 
     last_util_timestamp: Cell<Option<u64>>,
     // Store last applied offsets as a workaround when the driver doesn't tell us the current offset
@@ -331,6 +335,17 @@ impl NvidiaGpuController {
             }
         });
 
+        let asic_quality = nvapi
+            .as_ref()
+            .zip(nvapi_handle)
+            .and_then(|(nvapi, handle)| match nvapi.asic_quality(handle) {
+                Ok(quality) => quality,
+                Err(err) => {
+                    warn!("could not read ASIC quality: {err:#}");
+                    None
+                }
+            });
+
         Ok(Self {
             nvml,
             nvapi: nvapi.zip(nvapi_handle),
@@ -350,6 +365,7 @@ impl NvidiaGpuController {
             rm_fb,
             timings_cache: RefCell::new(None),
             nvapi_thermals_info,
+            asic_quality,
             initial_target_temp: target_temp,
             last_util_timestamp: Cell::new(None),
             fan_control_handle: RefCell::new(None),
@@ -1952,11 +1968,13 @@ impl GpuController for NvidiaGpuController {
                         .ok(),
                     amd_ip_info: vec![],
                     intel: IntelDrmInfo::default(),
+                    nvidia_asic_quality: self.asic_quality.clone(),
                     ..Default::default()
                 }),
                 flags: vec![
                     DeviceFlag::ConfigurableFanControl,
                     DeviceFlag::AutoFanThreshold,
+                    DeviceFlag::DumpableVBios,
                 ],
             }
         })
@@ -2370,8 +2388,20 @@ impl GpuController for NvidiaGpuController {
         Err(anyhow!("Not supported on Nvidia"))
     }
 
+    /// The PCI expansion ROM: the flashed legacy and EFI images. The data images that
+    /// hold the performance tables are not visible through the ROM BAR, so this is not a
+    /// full flash dump.
     fn vbios_dump(&self) -> anyhow::Result<Vec<u8>> {
-        Err(anyhow!("Not supported on Nvidia"))
+        let rom = vbios::read_pci_rom(&self.common.sysfs_path)?;
+        lact_vbios::parse(&rom).context("The PCI expansion ROM is not a valid vBIOS image")?;
+        Ok(rom)
+    }
+
+    fn vbios_info(&self) -> anyhow::Result<lact_schema::vbios::VbiosInfo> {
+        Ok(vbios::vbios_info(
+            &self.common.sysfs_path,
+            &self.common.pci_slot_name,
+        ))
     }
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]

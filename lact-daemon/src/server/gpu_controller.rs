@@ -94,6 +94,10 @@ pub trait GpuController {
 
     fn vbios_dump(&self) -> anyhow::Result<Vec<u8>>;
 
+    fn vbios_info(&self) -> anyhow::Result<lact_schema::vbios::VbiosInfo> {
+        Err(anyhow!("VBIOS info is not supported on this GPU"))
+    }
+
     fn process_list(&self) -> anyhow::Result<ProcessList>;
 
     #[cfg(feature = "display-info")]
