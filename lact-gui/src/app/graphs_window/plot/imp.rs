@@ -160,6 +160,7 @@ mod benches {
                         vram_clockspeed: Some(1000),
                         target_gpu_clockspeed: None,
                         sensors: IndexMap::new(),
+                        ..Default::default()
                     },
                     active_power_states: Some(ActivePowerStates {
                         core: Some(PowerLevelId::Index(0)),
@@ -211,6 +212,7 @@ mod benches {
                         gtt_used: None,
                     },
                     throttle_info: None,
+                    ..Default::default()
                 };
 
                 data.update_with_timestamp(&stats, 1.0, timestamp.as_millisecond());
